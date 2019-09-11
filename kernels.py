@@ -133,3 +133,41 @@ merge_all = cp.RawKernel(r'''
     }
     ''', 'merge_all')
 
+slice_gen_tex = cp.RawKernel(r'''
+    extern "C" __global__
+    void slice_gen(cudaTextureObject_t model,
+                   const double angle,
+                   const double scale,
+                   const long long size,
+                   const float *bg,
+                   const long long log_flag,
+                   float *view) {
+        int x = blockIdx.x * blockDim.x + threadIdx.x ;
+        int y = blockIdx.y * blockDim.y + threadIdx.y ;
+        if (x > size - 1 || y > size - 1)
+            return ;
+
+        int t = x*size + y ;
+        if (log_flag)
+            view[t] = -1000. ;
+        else
+            view[t] = 0. ;
+
+        float u = x / float(size) - 0.5f ;
+        float v = y / float(size) - 0.5f;
+        float ac = cos(angle), as = sin(angle) ;
+        float tu = u*ac - v*as + 0.5f ;
+        float tv = v*ac + u*as + 0.5f ;
+
+        view[t] = tex2D<float>(model, tu, tv) ;
+        view[t] *= scale ;
+        view[t] += bg[t] ;
+        if (log_flag) {
+            if (view[t] < 1.e-20)
+                view[t] = -1000. ;
+            else
+                view[t] = log(view[t]) ;
+        }
+    }
+    ''', 'slice_gen_tex')
+
