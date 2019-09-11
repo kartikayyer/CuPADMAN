@@ -135,7 +135,7 @@ merge_all = cp.RawKernel(r'''
 
 slice_gen_tex = cp.RawKernel(r'''
     extern "C" __global__
-    void slice_gen(cudaTextureObject_t model,
+    void slice_gen_tex(cudaTextureObject_t model,
                    const double angle,
                    const double scale,
                    const long long size,
@@ -159,7 +159,7 @@ slice_gen_tex = cp.RawKernel(r'''
         float tu = u*ac - v*as + 0.5f ;
         float tv = v*ac + u*as + 0.5f ;
 
-        view[t] = tex2D<float>(model, tu, tv) ;
+        view[t] = tex2D<float>(model, tv, tu) ;
         view[t] *= scale ;
         view[t] += bg[t] ;
         if (log_flag) {
