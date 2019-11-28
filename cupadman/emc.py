@@ -13,6 +13,7 @@ import h5py
 from mpi4py import MPI
 import cupy as cp
 
+from cupadman import Detector, CDataset
 import kernels
 P_MIN = 1.e-6
 MEM_THRESH = 0.8

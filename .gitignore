@@ -1,3 +1,7 @@
 __pycache__/
 data/
 *.nvvp
+*.egg-info/
+build/
+*.so
+cupadman/*.c
