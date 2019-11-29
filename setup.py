@@ -45,4 +45,10 @@ extensions = cythonize(ext_modules, language_level=3,
 
 setup(name='cupadman',
       packages=py_packages,
-      ext_modules=extensions)
+      ext_modules=extensions,
+      entry_points={'console_scripts': [
+        'emc_cu = cupadman.emc:main',
+        'make_data_cu = cupadman.make_data:main',
+        ],
+      },
+)
