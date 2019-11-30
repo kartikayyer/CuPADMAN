@@ -10,7 +10,7 @@ import h5py
 import numpy as np
 import cupy as cp
 
-import kernels
+import cupadman.kernels as kernels
 
 class DataGenerator():
     def __init__(self, config_file):
