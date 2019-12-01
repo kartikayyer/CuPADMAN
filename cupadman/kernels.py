@@ -1,6 +1,6 @@
 import cupy as cp
 
-slice_gen = cp.RawKernel(r'''
+_gen_rot = r'''
     extern "C" __device__
     void gen_rot(const double quaternion[4], double rot[3][3]) {
         double q0, q1, q2, q3, q01, q02, q03, q11, q12, q13, q22, q23, q33 ;
@@ -31,6 +31,9 @@ slice_gen = cp.RawKernel(r'''
         rot[2][2] = (1. - 2.*(q11 + q22)) ;
     }
 
+'''
+
+slice_gen = cp.RawKernel(_gen_rot + r'''
     extern "C" __global__
     void slice_gen(const double *model,
                    const double *quat,
@@ -58,7 +61,7 @@ slice_gen = cp.RawKernel(r'''
         int ix = __double2int_rd(rot_pix[0]) ;
         int iy = __double2int_rd(rot_pix[1]) ;
         int iz = __double2int_rd(rot_pix[2]) ;
-        if (ix < 0 || ix > size - 2 || iy < 0 || iy > size - 2) {
+        if (ix < 0 || ix > size - 2 || iy < 0 || iy > size - 2 || iz < 0 || iz > size - 2) {
             if (log_flag)
                 view[t] = -1.0e20 ;
             else
@@ -88,37 +91,7 @@ slice_gen = cp.RawKernel(r'''
     }
     ''', 'slice_gen')
 
-slice_merge = cp.RawKernel(r'''
-    extern "C" __device__
-    void gen_rot(const double quaternion[4], double rot[3][3]) {
-        double q0, q1, q2, q3, q01, q02, q03, q11, q12, q13, q22, q23, q33 ;
-        
-        q0 = quaternion[0] ;
-        q1 = quaternion[1] ;
-        q2 = quaternion[2] ;
-        q3 = quaternion[3] ;
-        
-        q01 = q0*q1 ;
-        q02 = q0*q2 ;
-        q03 = q0*q3 ;
-        q11 = q1*q1 ;
-        q12 = q1*q2 ;
-        q13 = q1*q3 ;
-        q22 = q2*q2 ;
-        q23 = q2*q3 ;
-        q33 = q3*q3 ;
-        
-        rot[0][0] = (1. - 2.*(q22 + q33)) ;
-        rot[0][1] = 2.*(q12 + q03) ;
-        rot[0][2] = 2.*(q13 - q02) ;
-        rot[1][0] = 2.*(q12 - q03) ;
-        rot[1][1] = (1. - 2.*(q11 + q33)) ;
-        rot[1][2] = 2.*(q01 + q23) ;
-        rot[2][0] = 2.*(q02 + q13) ;
-        rot[2][1] = 2.*(q23 - q01) ;
-        rot[2][2] = (1. - 2.*(q11 + q22)) ;
-    }
-
+slice_merge = cp.RawKernel(_gen_rot + r'''
     extern "C" __global__
     void slice_merge(const double *view,
                      const double *quat,
@@ -148,7 +121,7 @@ slice_merge = cp.RawKernel(r'''
         int ix = __double2int_rd(rot_pix[0]) ;
         int iy = __double2int_rd(rot_pix[1]) ;
         int iz = __double2int_rd(rot_pix[2]) ;
-        if (ix < 0 || ix > size - 2 || iy < 0 || iy > size - 2)
+        if (ix < 0 || ix > size - 2 || iy < 0 || iy > size - 2 || iz < 0 || iz > size - 2)
             return ;
 
         double fx = rot_pix[0] - ix, fy = rot_pix[1] - iy, fz = rot_pix[2] - iz ;
