@@ -11,9 +11,10 @@ enum frame_type {SPARSE, DENSE_INT, DENSE_DOUBLE} ;
 
 struct dataset {
 	char *fname ;
-    enum frame_type ftype ;
+	enum frame_type ftype ;
 	int num_data, num_pix ;
 	double mean_count ;
+	int *fcounts ;
 	struct detector *det ;
 
 	// Linked list information
@@ -32,5 +33,6 @@ struct dataset {
 } ;
 
 int parse_dataset(char*, struct detector*, struct dataset*) ;
+void calc_frame_counts(struct detector*, struct dataset*) ;
 
 #endif // EMCFILE_H

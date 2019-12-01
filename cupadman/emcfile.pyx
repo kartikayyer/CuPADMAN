@@ -30,6 +30,11 @@ cdef class CDataset:
 
         c_dset.parse_dataset(self.dset.fname, self.dset.det, self.dset)
 
+    def calc_frame_counts(self):
+        if self.dset.fname == NULL:
+            raise AttributeError('Parse dataset first before calculating frame counts')
+        c_dset.calc_frame_counts(self.dset.det, self.dset)
+
     def append(self, CDataset next_dset):
         cdef c_dset.dataset *curr = self.dset
         while curr.next != NULL:
@@ -46,11 +51,15 @@ cdef class CDataset:
         if self.dset.multi_accum != NULL: free(self.dset.multi_accum)
 
     @property
-    def fname(self): return (<bytes> self.dset.fname).decode()
+    def fname(self): return (<bytes> self.dset.fname).decode() if self.dset.fname != NULL else None
     @property
     def num_data(self): return self.dset.num_data
     @property
     def num_pix(self): return self.dset.num_pix
+    @property
+    def mean_count(self): return self.dset.mean_count
+    @property
+    def fcounts(self): return np.asarray(<int[:self.num_data]>self.dset.fcounts, dtype='i4')
     @property
     def ftype(self): return ['sparse', 'dense_integer', 'dense_double'][self.dset.ftype]
     @property

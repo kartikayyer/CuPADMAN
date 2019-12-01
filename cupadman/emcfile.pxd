@@ -8,6 +8,7 @@ cdef extern from "src/emcfile.h" nogil:
         frame_type ftype
         int num_data, num_pix
         double mean_count
+        int *fcounts
         detector *det
 
         # Linked list information
@@ -29,6 +30,7 @@ cdef extern from "src/emcfile.h" nogil:
         double *frames
 
     int parse_dataset(char*, detector*, dataset*)
+    void calc_frame_counts(detector*, dataset*)
 
 cdef class CDataset:
     cdef dataset *dset
