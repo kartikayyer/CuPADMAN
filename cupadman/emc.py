@@ -14,7 +14,7 @@ from mpi4py import MPI
 import cupy as cp
 
 from cupadman import Detector, CDataset, Quaternion
-import kernels
+import cupadman.kernels as kernels
 P_MIN = 1.e-6
 MEM_THRESH = 0.8
 
@@ -43,7 +43,6 @@ class EMC():
         config = configparser.ConfigParser()
         config.read(config_file)
 
-        self.size = config.getint('parameters', 'size')
         self.num_div = config.getint('emc', 'num_div')
         self.num_modes = config.getint('emc', 'num_modes', fallback=1)
         self.detector_file = os.path.join(os.path.dirname(config_file),
@@ -63,20 +62,25 @@ class EMC():
         self.det = Detector(self.detector_file)
         self.dset = CDataset(self.photons_file, self.det)
         self.quat = Quaternion(self.num_div)
+        self.size = int(2*np.ceil(np.linalg.norm(self.det.qvals, axis=1).max()) + 3)
         self._move_to_gpu()
         etime = time.time()
+        sys.stdout.flush()
+        sys.stderr.flush()
 
         if self.rank == 0:
             print('%d frames with %.3f photons/frame (%.3f s) (%.2f MB)' % \
-                    (self.dset.num_data, self.dset.mean_count, etime-stime, self.dset.mem/1024**2))
+                    (self.dset.num_data, self.dset.mean_count, etime-stime, self.dset_mem/1024**2))
             sys.stdout.flush()
+        self.quat.divide(self.rank, self.num_proc, self.num_modes)
         self.model = np.empty(3*(self.size,))
         if self.rank == 0:
             self.model[:] = np.random.random((self.size,)*3) * self.dset.mean_count / self.dset.num_pix
         self.comm.Bcast([self.model, MPI.DOUBLE], root=0)
         self.mweights = np.zeros(3*(self.size,))
         if self.need_scaling:
-            self.scales = self.dset.counts / self.dset.mean_count
+            self.dset.calc_frame_counts()
+            self.scales = cp.array(self.dset.fcounts) / self.dset.mean_count
         else:
             self.scales = cp.ones(self.dset.num_data, dtype='f8')
         self.prob = cp.array([])
@@ -95,18 +99,15 @@ class EMC():
         the scale factors are in self.scales.
         '''
 
-        num_rot_p = self.num_rot // self.num_proc
-        if self.rank < self.num_rot % self.num_proc:
-            num_rot_p += 1
-        mem_frac = num_rot_p*self.dset.num_data*8/ (self.mem_size - self.dset.mem)
+        mem_frac = self.quat.num_rot_p*self.dset.num_data*8/ (self.mem_size - self.dset_mem)
         num_blocks = int(np.ceil(mem_frac / MEM_THRESH))
         block_sizes = np.array([self.dset.num_data // num_blocks] * num_blocks)
         block_sizes[0:self.dset.num_data % num_blocks] += 1
-        #if len(block_sizes) > 1: print(block_sizes, 'frames in each block')
+        if len(block_sizes) > 1 and self.rank == 0: print(block_sizes, 'frames in each block')
 
-        if self.prob.shape != (num_rot_p, block_sizes.max()):
-            self.prob = cp.empty((num_rot_p, block_sizes.max()), dtype='f8')
-        views = cp.empty((self.num_streams, self.size**2), dtype='f8')
+        if self.prob.shape != (self.quat.num_rot_p, block_sizes.max()):
+            self.prob = cp.empty((self.quat.num_rot_p, block_sizes.max()), dtype='f8')
+        views = cp.empty((self.num_streams, self.det.num_pix), dtype='f8')
         dmodel = cp.array(self.model)
         dmweights = cp.array(self.mweights)
         #mp = cp.get_default_memory_pool()
@@ -128,18 +129,19 @@ class EMC():
         num_data_b = e - s
         self.bsize_data = int(np.ceil(num_data_b/32.))
 
-        for i, r in enumerate(range(self.rank, self.num_rot, self.num_proc)):
+        for i, r in enumerate(range(self.rank, self.quat.num_rot_p, self.num_proc)):
             snum = i % self.num_streams
             self.stream_list[snum].use()
+            rotind = r*self.num_proc + self.rank
             kernels.slice_gen((self.bsize_model,), (32,),
-                    (dmodel, self.quat.quats[r], 1.,
-                     self.det.qvals, self.det.num_pix,
+                    (dmodel, self.quats[rotind], self.qvals,
+                     1., self.det.num_pix,
                      self.size, 1, views[snum]))
             kernels.calc_prob_all((self.bsize_data,), (32,),
                     (views[snum], num_data_b,
-                     self.dset.ones[s:e], self.dset.multi[s:e],
-                     self.dset.ones_accum[s:e], self.dset.multi_accum[s:e],
-                     self.dset.place_ones, self.dset.place_multi, self.dset.count_multi,
+                     self.ones[s:e], self.multi[s:e],
+                     self.ones_accum[s:e], self.multi_accum[s:e],
+                     self.place_ones, self.place_multi, self.count_multi,
                      msum, self.scales[s:e], self.prob[i]))
         [s.synchronize() for s in self.stream_list]
         cp.cuda.Stream().null.use()
@@ -171,22 +173,24 @@ class EMC():
 
         dmodel[:] = 0
         dmweights[:] = 0
-        for i, r in enumerate(range(self.rank, self.num_rot, self.num_proc)):
+        for i, r in enumerate(range(self.rank, self.quat.num_rot_p, self.num_proc)):
             if h_p_norm[i] == 0.:
                 continue
             snum = i % self.num_streams
             self.stream_list[snum].use()
+            rotind = r*self.num_proc + self.rank
             views[snum,:] = 0
             kernels.merge_all((self.bsize_data,), (32,),
                     (self.prob[i], num_data_b,
-                     self.dset.ones[s:e], self.dset.multi[s:e],
-                     self.dset.ones_accum[s:e], self.dset.multi_accum[s:e],
-                     self.dset.place_ones, self.dset.place_multi, self.dset.count_multi,
+                     self.ones[s:e], self.multi[s:e],
+                     self.ones_accum[s:e], self.multi_accum[s:e],
+                     self.place_ones, self.place_multi, self.count_multi,
                      views[snum]))
-            views[snum] = views[snum] / p_norm[i] - self.dset.bg
+            #views[snum] = views[snum] / p_norm[i] - self.dset.bg
+            views[snum] = views[snum] / p_norm[i]
             kernels.slice_merge((self.bsize_model,), (32,),
-                    (views[snum], self.quat.quats[r],
-                     self.det.qvals, self.det.num_pix,
+                    (views[snum], self.quats[rotind],
+                     self.qvals, self.det.num_pix,
                      self.size, dmodel, dmweights))
         [s.synchronize() for s in self.stream_list]
         cp.cuda.Stream().null.use()
@@ -203,7 +207,7 @@ class EMC():
                 np.save('data/model.npy', self.model)
             else:
                 np.save('data/model_%.3d.npy'%iternum, self.model)
-                np.save('data/rmax_%.3d.npy'%iternum, self.rmax/self.num_rot*360.)
+                np.save('data/rmax_%.3d.npy'%iternum, self.rmax)
         else:
             self.comm.Reduce([self.model, MPI.DOUBLE], None, root=0, op=MPI.SUM)
             self.comm.Reduce([self.mweights, MPI.DOUBLE], None, root=0, op=MPI.SUM)
@@ -211,27 +215,29 @@ class EMC():
 
     def _move_to_gpu(self):
         '''Move detector, dataset and quaternions to GPU'''
-        self.det.qvals = cp.array(self.det.qvals)
-        self.quat.quats = cp.array(self.quat.quats)
+        self.qvals = cp.array(self.det.qvals.flatten())
+        self.quats = cp.array(self.quat.quats)
 
-        self.dset.ones = cp.array(self.dset.ones)
-        self.dset.multi = cp.array(self.dset.multi)
-        self.dset.ones_accum = cp.array(self.dset.ones_accum)
-        self.dset.multi_accum = cp.array(self.dset.multi_accum)
-        self.dset.place_ones = cp.array(self.dset.place_ones)
-        self.dset.place_multi = cp.array(self.dset.place_multi)
-        self.dset.count_multi = cp.array(self.dset.count_multi)
+        init_mem = cp.get_default_memory_pool().used_bytes()
+        self.ones = cp.array(self.dset.ones)
+        self.multi = cp.array(self.dset.multi)
+        self.ones_accum = cp.array(self.dset.ones_accum)
+        self.multi_accum = cp.array(self.dset.multi_accum)
+        self.place_ones = cp.array(self.dset.place_ones)
+        self.place_multi = cp.array(self.dset.place_multi)
+        self.count_multi = cp.array(self.dset.count_multi)
+        self.dset_mem = cp.get_default_memory_pool().used_bytes() - init_mem
 
 def main():
     '''Parses command line arguments and launches EMC reconstruction'''
     import socket
-    parser = argparse.ArgumentParser(description='In-plane rotation EMC')
+    parser = argparse.ArgumentParser(description='Cryptotomography with the EMC algorithm using MPI+CUDA')
     parser.add_argument('num_iter', type=int,
                         help='Number of iterations')
     parser.add_argument('-c', '--config_file', default='config.ini',
                         help='Path to configuration file (default: config.ini)')
     parser.add_argument('-d', '--devices', default=None,
-                        help='Path to devices file')
+                        help='Comma-separated list of device numbers')
     parser.add_argument('-s', '--streams', type=int, default=4,
                         help='Number of streams to use (default=4)')
     args = parser.parse_args()
@@ -242,15 +248,16 @@ def main():
     if args.devices is None:
         if num_proc == 1:
             print('Running on default device 0')
+            sys.stdout.flush()
         else:
-            print('Require a "devices" file if using multiple processes (one number per line)')
+            print('Require "devices" option when using multiple processes')
             sys.exit(1)
     else:
-        with open(args.devices) as f:
-            dev = int(f.readlines()[rank].strip())
-            print('Rank %d: %s (Device %d)' % (rank, socket.gethostname(), dev))
-            sys.stdout.flush()
-            cp.cuda.Device(dev).use()
+        dev = args.devices.split(',')
+        if len(dev) != num_proc:
+            print('Number of devices (with repetition) must equal number of MPI ranks')
+            sys.exit(1)
+        cp.cuda.Device(int(dev[rank])).use()
 
     recon = EMC(args.config_file, num_streams=args.streams)
     if rank == 0:
