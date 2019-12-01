@@ -59,7 +59,7 @@ cdef class CDataset:
     @property
     def mean_count(self): return self.dset.mean_count
     @property
-    def fcounts(self): return np.asarray(<int[:self.num_data]>self.dset.fcounts, dtype='i4')
+    def fcounts(self): return np.asarray(<int[:self.num_data]>self.dset.fcounts, dtype='i4') if self.dset.fcounts != NULL else None
     @property
     def ftype(self): return ['sparse', 'dense_integer', 'dense_double'][self.dset.ftype]
     @property
