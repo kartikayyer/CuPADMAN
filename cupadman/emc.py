@@ -53,6 +53,7 @@ class EMC():
                                           config.get('emc', 'output_folder', fallback='data/'))
         self.log_file = os.path.join(os.path.dirname(config_file),
                                      config.get('emc', 'log_file', fallback='EMC.log'))
+        model_fname = config.get('emc', 'start_model_file', fallback=None)
         self.need_scaling = config.getboolean('emc', 'need_scaling', fallback=False)
 
         # Setup reconstruction
@@ -62,6 +63,7 @@ class EMC():
         self.det = Detector(self.detector_file)
         self.dset = CDataset(self.photons_file, self.det)
         self.quat = Quaternion(self.num_div)
+        self.quat.divide(self.rank, self.num_proc, self.num_modes)
         self.size = int(2*np.ceil(np.linalg.norm(self.det.qvals, axis=1).max()) + 3)
         self._move_to_gpu()
         etime = time.time()
@@ -72,17 +74,24 @@ class EMC():
             print('%d frames with %.3f photons/frame (%.3f s) (%.2f MB)' % \
                     (self.dset.num_data, self.dset.mean_count, etime-stime, self.dset_mem/1024**2))
             sys.stdout.flush()
-        self.quat.divide(self.rank, self.num_proc, self.num_modes)
         self.model = np.empty(3*(self.size,))
         if self.rank == 0:
-            self.model[:] = np.random.random((self.size,)*3) * self.dset.mean_count / self.dset.num_pix
+            if model_fname is None:
+                print('Random start')
+                self.model[:] = np.random.random((self.size,)*3) * self.dset.mean_count / self.dset.num_pix
+            else:
+                print('Parsing model from', model_fname)
+                self.model[:] = np.load(model_fname)
         self.comm.Bcast([self.model, MPI.DOUBLE], root=0)
         self.mweights = np.zeros(3*(self.size,))
         if self.need_scaling:
             self.dset.calc_frame_counts()
             self.scales = cp.array(self.dset.fcounts) / self.dset.mean_count
+            self.beta_start = cp.array(np.exp(-6.5 * pow(self.dset.fcounts * 1.e-5, 0.15))) # Empirical
         else:
             self.scales = cp.ones(self.dset.num_data, dtype='f8')
+            self.beta_start = cp.array(np.exp(-6.5 * pow(np.ones(self.dset.num_data)*self.dset.mean_count * 1.e-5, 0.15))) # Empirical
+        print('Starting beta =', self.beta_start.mean())
         self.prob = cp.array([])
 
         self.bsize_model = int(np.ceil(self.det.num_pix/32.))
@@ -110,6 +119,11 @@ class EMC():
         views = cp.empty((self.num_streams, self.det.num_pix), dtype='f8')
         dmodel = cp.array(self.model)
         dmweights = cp.array(self.mweights)
+        if iternum is None:
+            self.beta = cp.copy(self.beta_start)
+        else:
+            factor = 2 ** ((iternum-1) // 10)
+            self.beta = self.beta_start * factor
         #mp = cp.get_default_memory_pool()
         #print('Mem usage: %.2f MB / %.2f MB' % (mp.total_bytes()/1024**2, self.mem_size/1024**2))
 
@@ -157,12 +171,11 @@ class EMC():
         self.comm.Allreduce([rmax_p, MPI.INT], [self.rmax, MPI.INT], op=MPI.MAX)
         max_exp = cp.array(max_exp)
 
-        self.prob = cp.exp(cp.subtract(self.prob, max_exp, self.prob), self.prob)
+        self.prob = cp.exp(self.beta*cp.subtract(self.prob, max_exp, self.prob), self.prob)
         psum_p = self.prob.sum(0).get()
         psum = np.empty_like(psum_p)
         self.comm.Allreduce([psum_p, MPI.DOUBLE], [psum, MPI.DOUBLE], op=MPI.SUM)
         self.prob = cp.divide(self.prob, cp.array(psum), self.prob)
-        self.prob.clip(a_min=P_MIN, out=self.prob)
 
     def _update_model(self, views, dmodel, dmweights, drange):
         p_norm = self.prob.sum(1)
@@ -272,7 +285,7 @@ def main():
         etime = time.time()
         if rank == 0:
             norm = float(cp.linalg.norm(cp.array(recon.model) - m0))
-            print('%-6d%-.2e %e' % (i+1, etime-stime, norm))
+            print('%-6d%-.2e %e %e' % (i+1, etime-stime, norm, recon.beta.mean()))
             sys.stdout.flush()
             if i > 0:
                 avgtime += etime-stime
