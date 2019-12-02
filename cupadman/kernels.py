@@ -190,6 +190,8 @@ merge_all = cp.RawKernel(r'''
         d = blockDim.x * blockIdx.x + threadIdx.x ;
         if (d >= ndata)
             return ;
+        if (prob_r[d] < 1.e-6)
+            return ;
 
         for (t = o_acc[d] ; t < o_acc[d] + ones[d] ; ++t)
             atomicAdd(&view[p_o[t]], prob_r[d]) ;
