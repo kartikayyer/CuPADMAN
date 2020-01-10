@@ -143,12 +143,11 @@ class EMC():
         num_data_b = e - s
         self.bsize_data = int(np.ceil(num_data_b/32.))
 
-        for i, r in enumerate(range(self.rank, self.quat.num_rot_p, self.num_proc)):
+        for i, r in enumerate(range(self.rank, self.quat.num_rot, self.num_proc)):
             snum = i % self.num_streams
             self.stream_list[snum].use()
-            rotind = r*self.num_proc + self.rank
             kernels.slice_gen((self.bsize_model,), (32,),
-                    (dmodel, self.quats[rotind], self.qvals,
+                    (dmodel, self.quats[r], self.qvals,
                      1., self.det.num_pix,
                      self.size, 1, views[snum]))
             kernels.calc_prob_all((self.bsize_data,), (32,),
@@ -156,7 +155,7 @@ class EMC():
                      self.ones[s:e], self.multi[s:e],
                      self.ones_accum[s:e], self.multi_accum[s:e],
                      self.place_ones, self.place_multi, self.count_multi,
-                     msum, self.scales[s:e], self.prob[i]))
+                     msum*self.quats[r,4], self.scales[s:e], self.prob[i]))
         [s.synchronize() for s in self.stream_list]
         cp.cuda.Stream().null.use()
 
@@ -191,7 +190,6 @@ class EMC():
                 continue
             snum = i % self.num_streams
             self.stream_list[snum].use()
-            rotind = r*self.num_proc + self.rank
             views[snum,:] = 0
             kernels.merge_all((self.bsize_data,), (32,),
                     (self.prob[i], num_data_b,
@@ -202,7 +200,7 @@ class EMC():
             #views[snum] = views[snum] / p_norm[i] - self.dset.bg
             views[snum] = views[snum] / p_norm[i]
             kernels.slice_merge((self.bsize_model,), (32,),
-                    (views[snum], self.quats[rotind],
+                    (views[snum], self.quats[r],
                      self.qvals, self.det.num_pix,
                      self.size, dmodel, dmweights))
         [s.synchronize() for s in self.stream_list]
