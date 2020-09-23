@@ -58,14 +58,16 @@ class EMC():
 
         # Setup reconstruction
         stime = time.time()
-        #self.dset = Dataset(self.photons_file, self.size**2, self.need_scaling)
+
         # Note the following three structs have data in CPU memory
         self.det = Detector(self.detector_file)
         self.dset = CDataset(self.photons_file, self.det)
         self.quat = Quaternion(self.num_div)
+
         self.quat.divide(self.rank, self.num_proc, self.num_modes)
         self.size = int(2*np.ceil(np.linalg.norm(self.det.qvals, axis=1).max()) + 3)
         self._move_to_gpu()
+
         etime = time.time()
         sys.stdout.flush()
         sys.stderr.flush()
@@ -98,16 +100,17 @@ class EMC():
         self.bsize_data = int(np.ceil(self.dset.num_data/32.))
         self.stream_list = [cp.cuda.Stream() for _ in range(self.num_streams)]
 
-    def run_iteration(self, iternum=None):
-        '''Run one iterations of EMc algorithm
+    def run_iteration(self, iternum=1):
+        '''Run one iterations of EMC algorithm
 
         Args:
-            iternum (int, optional): If specified, output is tagged with iteration number
+            iternum (int): Iteration number
 
         Current guess is assumed to be in self.model, which is updated. If scaling is included,
         the scale factors are in self.scales.
         '''
 
+        stime = time.time()
         mem_frac = self.quat.num_rot_p*self.dset.num_data*8/ (self.mem_size - self.dset_mem)
         num_blocks = int(np.ceil(mem_frac / MEM_THRESH))
         block_sizes = np.array([self.dset.num_data // num_blocks] * num_blocks)
@@ -119,11 +122,8 @@ class EMC():
         views = cp.empty((self.num_streams, self.det.num_pix), dtype='f8')
         dmodel = cp.array(self.model)
         dmweights = cp.array(self.mweights)
-        if iternum is None:
-            self.beta = cp.copy(self.beta_start)
-        else:
-            factor = 2 ** ((iternum-1) // 10)
-            self.beta = self.beta_start * factor
+        factor = 2 ** ((iternum-1) // 10)
+        self.beta = self.beta_start * factor
         #mp = cp.get_default_memory_pool()
         #print('Mem usage: %.2f MB / %.2f MB' % (mp.total_bytes()/1024**2, self.mem_size/1024**2))
 
@@ -134,7 +134,10 @@ class EMC():
             self._normalize_prob()
             self._update_model(views, dmodel, dmweights, drange)
             b_start += b
-        self._normalize_model(dmodel, dmweights, iternum)
+        diff = self._normalize_model(dmodel, dmweights, iternum)
+        etime = time.time()
+        if self.rank == 0:
+            self._write_log(iternum, etime-stime, diff)
 
     def _calculate_prob(self, dmodel, views, drange):
         msum = float(-self.model.sum())
@@ -214,15 +217,40 @@ class EMC():
             self.comm.Reduce(MPI.IN_PLACE, [self.mweights, MPI.DOUBLE], root=0, op=MPI.SUM)
             self.model[self.mweights > 0] /= self.mweights[self.mweights > 0]
 
-            if iternum is None:
-                np.save('data/model.npy', self.model)
-            else:
-                np.save('data/model_%.3d.npy'%iternum, self.model)
-                np.save('data/rmax_%.3d.npy'%iternum, self.rmax)
+            self._save_output(iternum)
+            diff = np.linalg.norm(self.model - dmodel.get())
         else:
             self.comm.Reduce([self.model, MPI.DOUBLE], None, root=0, op=MPI.SUM)
             self.comm.Reduce([self.mweights, MPI.DOUBLE], None, root=0, op=MPI.SUM)
+            diff = 0.
         self.comm.Bcast([self.model, MPI.DOUBLE], root=0)
+        return diff
+
+    def _save_output(self, iternum):
+        fptr = h5py.File(self.output_folder + '/output_%.3d.h5'%iternum, 'w')
+        fptr['intens'] = self.model[np.newaxis]
+        fptr['inter_weight'] = self.mweights[np.newaxis]
+        fptr['orientations'] = self.rmax
+        fptr['scale'] = self.scales.get()
+        fptr.close()
+
+    def _write_log(self, iternum, itertime, norm):
+        if iternum == 1:
+            fptr = open(self.log_file, 'w')
+            fptr.write('Cryptotomography with the EMC algorithm using MPI+CUDA\n\n')
+            fptr.write('Data parameters:\n\tnum_data = %d\n\tmean_count = %f\n\n' % (self.dset.num_data, self.dset.mean_count))
+            fptr.write('System size:\n\tnum_rot = %d\n\tnum_pix = %d/%d\n\tvolume = %d x %d x %d x %d\n\n' % (self.quat.num_rot, (self.det.raw_mask==0).sum(), self.det.num_pix, self.num_modes, self.size, self.size ,self.size))
+            fptr.write('Reconstruction parameters:\n\t')
+            fptr.write('num_proc = %d\n\t'%self.num_proc)
+            fptr.write('alpha = 0.0\n\t')
+            fptr.write('beta = %f\n\t'%self.beta.mean())
+            fptr.write('need_scaling = %s\n\n'%('yes' if self.need_scaling else 'no'))
+            fptr.write('Iter  time     rms_change   info_rate  log-likelihood  num_rot  beta\n')
+        else:
+            fptr = open(self.log_file, 'a')
+
+        fptr.write('%-6d%-.2e %e %f   %e    %-8d %f\n' % (iternum, itertime, norm, 0, 0, self.quat.num_rot, self.beta.mean()))
+        fptr.close()
 
     def _move_to_gpu(self):
         '''Move detector, dataset and quaternions to GPU'''
@@ -272,7 +300,7 @@ def main():
 
     recon = EMC(args.config_file, num_streams=args.streams)
     if rank == 0:
-        print('\nIter  time(s)  change')
+        print('\nIter  time(s)  change       beta')
         sys.stdout.flush()
         avgtime = 0.
         numavg = 0
