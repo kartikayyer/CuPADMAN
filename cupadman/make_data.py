@@ -10,8 +10,6 @@ import h5py
 import numpy as np
 import cupy as cp
 
-import cupadman.kernels as kernels
-
 class DataGenerator():
     def __init__(self, config_file):
         config = configparser.ConfigParser()
@@ -31,6 +29,11 @@ class DataGenerator():
         self.mask_sum = 0
         self.bgmask = cp.zeros_like(self.mask)
         self.bgmask_sum = 0
+
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        with open(script_dir+'/kernels.cu', 'r') as f:
+            kernels = cp.RawModule(code=f.read())
+        self.k_slice_gen = kernels.get_function('slice_gen')
 
     def make_mask(self, cmin=0.05, bg=False):
         mask = self.bgmask if bg else self.mask
@@ -130,7 +133,7 @@ class DataGenerator():
             bsize_model = int(np.ceil(self.size/32.))
             stime = time.time()
             for i in range(self.num_data):
-                kernels.slice_gen((bsize_model,)*2, (32,)*2,
+                self.k_slice_gen((bsize_model,)*2, (32,)*2,
                     (self.mask, ang[i], scale[i], self.size, self.bgmask, 0, rot_mask))
                 frame = cp.random.poisson(rot_mask, dtype='i4').ravel()
                 place_ones[i] = cp.where(frame == 1)[0].get()

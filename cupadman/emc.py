@@ -14,7 +14,6 @@ from mpi4py import MPI
 import cupy as cp
 
 from cupadman import Detector, CDataset, Quaternion
-import cupadman.kernels as kernels
 P_MIN = 1.e-6
 MEM_THRESH = 0.8
 
@@ -71,6 +70,15 @@ class EMC():
         etime = time.time()
         sys.stdout.flush()
         sys.stderr.flush()
+
+        # Get CUDA kernels
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        with open(script_dir+'/kernels.cu', 'r') as f:
+            kernels = cp.RawModule(code=f.read())
+        self.k_slice_gen = kernels.get_function('slice_gen')
+        self.k_slice_merge = kernels.get_function('slice_merge')
+        self.k_calc_prob_all = kernels.get_function('calc_prob_all')
+        self.k_merge_all = kernels.get_function('merge_all')
 
         if self.rank == 0:
             print('%d frames with %.3f photons/frame (%.3f s) (%.2f MB)' % \
@@ -149,7 +157,7 @@ class EMC():
         for i, r in enumerate(range(self.rank, self.quat.num_rot, self.num_proc)):
             snum = i % self.num_streams
             self.stream_list[snum].use()
-            kernels.slice_gen((self.bsize_model,), (32,),
+            self.k_slice_gen((self.bsize_model,), (32,),
                     (dmodel, self.quats[r], self.qvals,
                      1., self.det.num_pix,
                      self.size, 0, views[snum]))
@@ -171,7 +179,7 @@ class EMC():
         for i, r in enumerate(range(self.rank, self.quat.num_rot, self.num_proc)):
             snum = i % self.num_streams
             self.stream_list[snum].use()
-            kernels.slice_gen((self.bsize_model,), (32,),
+            self.k_slice_gen((self.bsize_model,), (32,),
                     (dmodel, self.quats[r], self.qvals,
                      1., self.det.num_pix,
                      self.size, 1, views[snum]))
@@ -179,7 +187,7 @@ class EMC():
             #initval = - float(views[snum].sum())
             #initval = 0.
             initval = -self.vsum[r] * self.rescale
-            kernels.calc_prob_all((self.bsize_data,), (32,),
+            self.k_calc_prob_all((self.bsize_data,), (32,),
                     (views[snum], num_data_b,
                      self.ones[s:e], self.multi[s:e],
                      self.ones_accum[s:e], self.multi_accum[s:e],
@@ -222,7 +230,7 @@ class EMC():
             snum = i % self.num_streams
             self.stream_list[snum].use()
             views[snum,:] = 0
-            kernels.merge_all((self.bsize_data,), (32,),
+            self.k_merge_all((self.bsize_data,), (32,),
                     (self.prob[i], num_data_b,
                      self.ones[s:e], self.multi[s:e],
                      self.ones_accum[s:e], self.multi_accum[s:e],
@@ -230,7 +238,7 @@ class EMC():
                      views[snum]))
             #views[snum] = views[snum] / p_norm[i] - self.dset.bg
             views[snum] = views[snum] / p_norm[i]
-            kernels.slice_merge((self.bsize_model,), (32,),
+            self.k_slice_merge((self.bsize_model,), (32,),
                     (views[snum], self.quats[r],
                      self.qvals, self.det.num_pix,
                      self.size, dmodel, dmweights))
