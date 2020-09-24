@@ -83,7 +83,9 @@ class EMC():
                 self.model[:] = np.random.random((self.size,)*3) * self.dset.mean_count / self.dset.num_pix
             else:
                 print('Parsing model from', model_fname)
-                self.model[:] = np.load(model_fname)
+                with h5py.File(model_fname, 'r') as fptr:
+                    self.model[:] = fptr['intens'][0]
+                #self.model[:] = np.load(model_fname)
         self.comm.Bcast([self.model, MPI.DOUBLE], root=0)
         self.mweights = np.zeros(3*(self.size,))
         if self.need_scaling:
@@ -126,6 +128,7 @@ class EMC():
         self.beta = self.beta_start * factor
         #mp = cp.get_default_memory_pool()
         #print('Mem usage: %.2f MB / %.2f MB' % (mp.total_bytes()/1024**2, self.mem_size/1024**2))
+        self._calculate_rescale(dmodel, views)
 
         b_start = 0
         for b in block_sizes:
@@ -139,8 +142,27 @@ class EMC():
         if self.rank == 0:
             self._write_log(iternum, etime-stime, diff)
 
+    def _calculate_rescale(self, dmodel, views):
+        self.vsum = cp.zeros(self.quat.num_rot, dtype='f8')
+        total = 0.
+
+        for i, r in enumerate(range(self.rank, self.quat.num_rot, self.num_proc)):
+            snum = i % self.num_streams
+            self.stream_list[snum].use()
+            kernels.slice_gen((self.bsize_model,), (32,),
+                    (dmodel, self.quats[r], self.qvals,
+                     1., self.det.num_pix,
+                     self.size, 0, views[snum]))
+            self.vsum[r] = views[snum][self.det.raw_mask==0].sum()
+            total += self.vsum[r] * self.quat.quats[r,4]
+        [s.synchronize() for s in self.stream_list]
+        cp.cuda.Stream().null.use()
+
+        self.rescale = self.dset.mean_count / total
+        print('rescale =', self.rescale)
+
     def _calculate_prob(self, dmodel, views, drange):
-        msum = float(-self.model.sum())
+        msum = float(-self.model.sum()) # This only works for Padman, not 3D
         s = drange[0]
         e = drange[1]
         num_data_b = e - s
@@ -153,12 +175,17 @@ class EMC():
                     (dmodel, self.quats[r], self.qvals,
                      1., self.det.num_pix,
                      self.size, 1, views[snum]))
+            #initval = float(cp.log(self.quats[r,4])) - float(views[snum].sum())
+            #initval = - float(views[snum].sum())
+            #initval = 0.
+            initval = -self.vsum[r] * self.rescale
             kernels.calc_prob_all((self.bsize_data,), (32,),
                     (views[snum], num_data_b,
                      self.ones[s:e], self.multi[s:e],
                      self.ones_accum[s:e], self.multi_accum[s:e],
                      self.place_ones, self.place_multi, self.count_multi,
-                     msum*self.quats[r,4], self.scales[s:e], self.prob[i]))
+                     #msum*self.quats[r,4], self.scales[s:e], self.prob[i]))
+                     initval, self.scales[s:e], self.prob[i]))
         [s.synchronize() for s in self.stream_list]
         cp.cuda.Stream().null.use()
 
@@ -178,6 +205,7 @@ class EMC():
         psum = np.empty_like(psum_p)
         self.comm.Allreduce([psum_p, MPI.DOUBLE], [psum, MPI.DOUBLE], op=MPI.SUM)
         self.prob = cp.divide(self.prob, cp.array(psum), self.prob)
+        #np.save(self.output_folder+'/prob_001.npy', self.prob.get())
 
     def _update_model(self, views, dmodel, dmweights, drange):
         p_norm = self.prob.sum(1)
