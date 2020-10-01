@@ -106,7 +106,7 @@ class EMC():
         print('Starting beta =', self.beta_start.mean())
         self.prob = cp.array([])
 
-        self.bsize_model = int(np.ceil(self.det.num_pix/32.))
+        self.bsize_pixel = int(np.ceil(self.det.num_pix/32.))
         self.bsize_data = int(np.ceil(self.dset.num_data/32.))
         self.stream_list = [cp.cuda.Stream() for _ in range(self.num_streams)]
 
@@ -157,20 +157,19 @@ class EMC():
         for i, r in enumerate(range(self.rank, self.quat.num_rot, self.num_proc)):
             snum = i % self.num_streams
             self.stream_list[snum].use()
-            self.k_slice_gen((self.bsize_model,), (32,),
-                    (dmodel, self.quats[r], self.qvals,
-                     1., self.det.num_pix,
-                     self.size, 0, views[snum]))
+            self.k_slice_gen((self.bsize_pixel,), (32,),
+                    (dmodel, self.quats[r], self.pixvals,
+                     self.dmask, 0., self.det.num_pix,
+                     self.size, views[snum]))
             self.vsum[r] = views[snum][self.det.raw_mask==0].sum()
             total += self.vsum[r] * self.quat.quats[r,4]
         [s.synchronize() for s in self.stream_list]
         cp.cuda.Stream().null.use()
 
         self.rescale = self.dset.mean_count / total
-        print('rescale =', self.rescale)
+        #print('rescale =', self.rescale)
 
     def _calculate_prob(self, dmodel, views, drange):
-        msum = float(-self.model.sum()) # This only works for Padman, not 3D
         s = drange[0]
         e = drange[1]
         num_data_b = e - s
@@ -179,21 +178,20 @@ class EMC():
         for i, r in enumerate(range(self.rank, self.quat.num_rot, self.num_proc)):
             snum = i % self.num_streams
             self.stream_list[snum].use()
-            self.k_slice_gen((self.bsize_model,), (32,),
-                    (dmodel, self.quats[r], self.qvals,
-                     1., self.det.num_pix,
-                     self.size, 1, views[snum]))
+            self.k_slice_gen((self.bsize_pixel,), (32,),
+                    (dmodel, self.quats[r], self.pixvals,
+                     self.dmask, 1., self.det.num_pix,
+                     self.size, views[snum]))
             #initval = float(cp.log(self.quats[r,4])) - float(views[snum].sum())
             #initval = - float(views[snum].sum())
             #initval = 0.
-            initval = -self.vsum[r] * self.rescale
+            initval = float(cp.log(self.quats[r,4]) - self.vsum[r] * self.rescale)
             self.k_calc_prob_all((self.bsize_data,), (32,),
                     (views[snum], num_data_b,
                      self.ones[s:e], self.multi[s:e],
                      self.ones_accum[s:e], self.multi_accum[s:e],
                      self.place_ones, self.place_multi, self.count_multi,
-                     #msum*self.quats[r,4], self.scales[s:e], self.prob[i]))
-                     initval, self.scales[s:e], self.prob[i]))
+                     self.dmask, initval, self.scales[s:e], self.prob[i]))
         [s.synchronize() for s in self.stream_list]
         cp.cuda.Stream().null.use()
 
@@ -213,7 +211,6 @@ class EMC():
         psum = np.empty_like(psum_p)
         self.comm.Allreduce([psum_p, MPI.DOUBLE], [psum, MPI.DOUBLE], op=MPI.SUM)
         self.prob = cp.divide(self.prob, cp.array(psum), self.prob)
-        #np.save(self.output_folder+'/prob_001.npy', self.prob.get())
 
     def _update_model(self, views, dmodel, dmweights, drange):
         p_norm = self.prob.sum(1)
@@ -224,7 +221,7 @@ class EMC():
 
         dmodel[:] = 0
         dmweights[:] = 0
-        for i, r in enumerate(range(self.rank, self.quat.num_rot_p, self.num_proc)):
+        for i, r in enumerate(range(self.rank, self.quat.num_rot, self.num_proc)):
             if h_p_norm[i] == 0.:
                 continue
             snum = i % self.num_streams
@@ -235,17 +232,18 @@ class EMC():
                      self.ones[s:e], self.multi[s:e],
                      self.ones_accum[s:e], self.multi_accum[s:e],
                      self.place_ones, self.place_multi, self.count_multi,
-                     views[snum]))
+                     self.dmask, views[snum]))
             #views[snum] = views[snum] / p_norm[i] - self.dset.bg
             views[snum] = views[snum] / p_norm[i]
-            self.k_slice_merge((self.bsize_model,), (32,),
+            self.k_slice_merge((self.bsize_pixel,), (32,),
                     (views[snum], self.quats[r],
-                     self.qvals, self.det.num_pix,
+                     self.pixvals, self.dmask, self.det.num_pix,
                      self.size, dmodel, dmweights))
         [s.synchronize() for s in self.stream_list]
         cp.cuda.Stream().null.use()
 
     def _normalize_model(self, dmodel, dmweights, iternum):
+        old_model = np.copy(self.model)
         self.model = dmodel.get()
         self.mweights = dmweights.get()
         if self.rank == 0:
@@ -254,7 +252,7 @@ class EMC():
             self.model[self.mweights > 0] /= self.mweights[self.mweights > 0]
 
             self._save_output(iternum)
-            diff = np.linalg.norm(self.model - dmodel.get())
+            diff = np.linalg.norm(self.model - old_model)
         else:
             self.comm.Reduce([self.model, MPI.DOUBLE], None, root=0, op=MPI.SUM)
             self.comm.Reduce([self.mweights, MPI.DOUBLE], None, root=0, op=MPI.SUM)
@@ -290,7 +288,9 @@ class EMC():
 
     def _move_to_gpu(self):
         '''Move detector, dataset and quaternions to GPU'''
-        self.qvals = cp.array(self.det.qvals.flatten())
+        self.dmask = cp.array(self.det.raw_mask)
+        self.pixvals = cp.array(np.concatenate((self.det.qvals, self.det.corr[:,np.newaxis]), axis=1).ravel())
+
         self.quats = cp.array(self.quat.quats)
 
         init_mem = cp.get_default_memory_pool().used_bytes()
