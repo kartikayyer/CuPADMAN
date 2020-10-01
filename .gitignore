@@ -1,7 +1,17 @@
+# Python cache
 __pycache__/
+
+# Data directory
 data/
-*.nvvp
+
+# Python build files
 *.egg-info/
 build/
 *.so
 cupadman/*.c
+
+# Log files etc
+*.nvvp
+*.out
+*.txt
+*.log
