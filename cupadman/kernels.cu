@@ -137,7 +137,7 @@ void slice_merge(const double *view, const double *quat, const double *pixvals, 
 }
 
 __global__
-void calc_prob_all(const double *lview, const long long ndata, const int *ones, const int *multi,
+void calc_prob_all(const double *lview, const long long ndata, const uint8_t *blacklist, const int *ones, const int *multi,
                    const long long *o_acc, const long long *m_acc, const int *p_o, const int *p_m,
                    const int *c_m, const uint8_t *mask, const double init, const double *scales, double *prob_r) {
 	long long d, t ;
@@ -145,8 +145,9 @@ void calc_prob_all(const double *lview, const long long ndata, const int *ones, 
 	d = blockDim.x * blockIdx.x + threadIdx.x ;
 	if (d >= ndata)
 		return ;
+	if (blacklist[d] == 1)
+		return ;
 
-	//prob_r[d] = init * scales[d] ;
 	prob_r[d] = init ;
 	for (t = o_acc[d] ; t < o_acc[d] + ones[d] ; ++t) {
 		pixel = p_o[t] ;
@@ -161,13 +162,15 @@ void calc_prob_all(const double *lview, const long long ndata, const int *ones, 
 }
 
 __global__
-void merge_all(const double *prob_r, const long long ndata, const int *ones, const int *multi,
+void merge_all(const double *prob_r, const long long ndata, const uint8_t *blacklist, const int *ones, const int *multi,
                const long long *o_acc, const long long *m_acc, const int *p_o, const int *p_m,
                const int *c_m, const uint8_t *mask, double *view) {
 	long long d, t ;
 	int pixel ;
 	d = blockDim.x * blockIdx.x + threadIdx.x ;
 	if (d >= ndata)
+		return ;
+	if (blacklist[d] == 1)
 		return ;
 	if (prob_r[d] < 1.e-6)
 		return ;

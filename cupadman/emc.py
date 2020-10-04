@@ -42,37 +42,41 @@ class EMC():
         # Parse config file
         config = configparser.ConfigParser()
         config.read(config_file)
+        config_dir = os.path.dirname(config_file)
 
         self.num_div = config.getint('emc', 'num_div')
         self.num_modes = config.getint('emc', 'num_modes', fallback=1)
-        self.detector_file = os.path.join(os.path.dirname(config_file),
-                                         config.get('emc', 'in_detector_file'))
-        self.photons_file = os.path.join(os.path.dirname(config_file),
-                                         config.get('emc', 'in_photons_file'))
-        self.output_folder = os.path.join(os.path.dirname(config_file),
-                                          config.get('emc', 'output_folder', fallback='data/'))
-        self.log_file = os.path.join(os.path.dirname(config_file),
-                                     config.get('emc', 'log_file', fallback='EMC.log'))
-        model_fname = config.get('emc', 'start_model_file', fallback=None)
+        detector_fname = os.path.join(config_dir,
+            config.get('emc', 'in_detector_file'))
+        photons_fname = os.path.join(config_dir,
+            config.get('emc', 'in_photons_file'))
+        self.output_folder = os.path.join(config_dir,
+            config.get('emc', 'output_folder', fallback='data/'))
+        self.log_file = os.path.join(config_dir,
+            config.get('emc', 'log_file', fallback='EMC.log'))
+        model_fname = os.path.join(config_dir,
+            config.get('emc', 'start_model_file', fallback=''))
+        blacklist_fname = os.path.join(config_dir,
+            config.get('emc', 'blacklist_file', fallback=''))
         self.need_scaling = config.getboolean('emc', 'need_scaling', fallback=False)
 
         # Setup reconstruction
         stime = time.time()
 
-        # Note the following three structs have data in CPU memory
-        self.det = Detector(self.detector_file)
-        self.dset = CDataset(self.photons_file, self.det)
+        # -- Generate detector, dataset, quaternions
+        # -- Note the following three structs have data in CPU memory
+        self.det = Detector(detector_fname)
+        self.dset = CDataset(photons_fname, self.det)
         self.quat = Quaternion(self.num_div)
 
         self.quat.divide(self.rank, self.num_proc, self.num_modes)
         self.size = int(2*np.ceil(np.linalg.norm(self.det.qvals, axis=1).max()) + 3)
         self._move_to_gpu()
 
-        etime = time.time()
-        sys.stdout.flush()
-        sys.stderr.flush()
+        self._log_print('%d frames with %.3f photons/frame (%.3f s) (%.2f MB)' % \
+                        (self.dset.num_data, self.dset.mean_count, time.time()-stime, self.dset_mem/1024**2))
 
-        # Get CUDA kernels
+        # -- Get CUDA kernels
         script_dir = os.path.dirname(os.path.abspath(__file__))
         with open(script_dir+'/kernels.cu', 'r') as f:
             kernels = cp.RawModule(code=f.read())
@@ -81,8 +85,7 @@ class EMC():
         self.k_calc_prob_all = kernels.get_function('calc_prob_all')
         self.k_merge_all = kernels.get_function('merge_all')
 
-        self._log_print('%d frames with %.3f photons/frame (%.3f s) (%.2f MB)' % \
-                        (self.dset.num_data, self.dset.mean_count, etime-stime, self.dset_mem/1024**2))
+        # -- Generate iterate
         self.model = np.empty(3*(self.size,))
         if self.rank == 0:
             if model_fname is None:
@@ -92,7 +95,6 @@ class EMC():
                 self._log_print('Starting from %s'%model_fname)
                 with h5py.File(model_fname, 'r') as fptr:
                     self.model[:] = fptr['intens'][0]
-                #self.model[:] = np.load(model_fname)
         self.comm.Bcast([self.model, MPI.DOUBLE], root=0)
         self.mweights = np.zeros(3*(self.size,))
         if self.need_scaling:
@@ -103,6 +105,13 @@ class EMC():
             self.scales = cp.ones(self.dset.num_data, dtype='f8')
             self.beta_start = cp.array(np.exp(-6.5 * pow(np.ones(self.dset.num_data)*self.dset.mean_count * 1.e-5, 0.15))) # Empirical
         self._log_print('Starting average beta = %f' % self.beta_start.mean())
+        if blacklist_fname == config_dir:
+            self.blacklist = cp.zeros(self.dset.num_data, dtype='u1')
+        else:
+            self.blacklist = cp.array(np.loadtxt(blacklist_fname, dtype='u1'))
+            assert self.blacklist.shape[0] == self.dset.num_data
+        self.num_blacklist = self.blacklist.sum()
+        self._log_print('%d/%d blacklisted frames'%(self.num_blacklist, self.dset.num_data))
         self.prob = cp.array([])
 
         self.bsize_pixel = int(np.ceil(self.det.num_pix/32.))
@@ -185,12 +194,9 @@ class EMC():
                     (dmodel, self.quats[r], self.pixvals,
                      self.dmask, 1., self.det.num_pix,
                      self.size, views[snum]))
-            #initval = float(cp.log(self.quats[r,4])) - float(views[snum].sum())
-            #initval = - float(views[snum].sum())
-            #initval = 0.
             initval = float(cp.log(self.quats[r,4]) - self.vsum[r] * self.rescale)
             self.k_calc_prob_all((self.bsize_data,), (32,),
-                    (views[snum], num_data_b,
+                    (views[snum], num_data_b, self.blacklist[s:e],
                      self.ones[s:e], self.multi[s:e],
                      self.ones_accum[s:e], self.multi_accum[s:e],
                      self.place_ones, self.place_multi, self.count_multi,
@@ -221,7 +227,7 @@ class EMC():
 
         #priv->likelihood[d] += prob[d][ind] * (temp - frames->sum_fact[d]) ;
         info_p = (self.prob * cp.log(self.prob / self.quats[self.rank::self.num_proc, 4][:,cp.newaxis])).sum(0).get()
-        self.mutual_info = np.empty(self.dset.num_data)
+        self.mutual_info = np.zeros(self.dset.num_data)
         self.comm.Allreduce([info_p, MPI.DOUBLE], [self.mutual_info, MPI.DOUBLE], op=MPI.SUM)
 
         self._log_print('\tnorm\t%f'%(time.time() - stime))
@@ -243,7 +249,7 @@ class EMC():
             self.stream_list[snum].use()
             views[snum,:] = 0
             self.k_merge_all((self.bsize_data,), (32,),
-                    (self.prob[i], num_data_b,
+                    (self.prob[i], num_data_b, self.blacklist[s:e],
                      self.ones[s:e], self.multi[s:e],
                      self.ones_accum[s:e], self.multi_accum[s:e],
                      self.place_ones, self.place_multi, self.count_multi,
@@ -293,7 +299,7 @@ class EMC():
         if iternum == 1:
             fptr = open(self.log_file, 'w')
             fptr.write('Cryptotomography with the EMC algorithm using MPI+CUDA\n\n')
-            fptr.write('Data parameters:\n\tnum_data = %d\n\tmean_count = %f\n\n' % (self.dset.num_data, self.dset.mean_count))
+            fptr.write('Data parameters:\n\tnum_data = %d/%d\n\tmean_count = %f\n\n' % (self.dset.num_data-self.num_blacklist, self.dset.num_data, self.dset.mean_count))
             fptr.write('System size:\n\tnum_rot = %d\n\tnum_pix = %d/%d\n\tsystem_volume = %d x %d x %d x %d\n\n' % (self.quat.num_rot, (self.det.raw_mask==0).sum(), self.det.num_pix, self.num_modes, self.size, self.size ,self.size))
             fptr.write('Reconstruction parameters:\n\t')
             fptr.write('num_proc = %d\n\t'%self.num_proc)
@@ -304,7 +310,8 @@ class EMC():
         else:
             fptr = open(self.log_file, 'a')
 
-        fptr.write('%-6d%-.2f   %.4e   %f   %e    %-8d %f\n' % (iternum, itertime, norm, self.mutual_info.mean(), 0, self.quat.num_rot, self.beta.mean()))
+        mean_info = self.mutual_info.sum() / (self.dset.num_data - self.num_blacklist)
+        fptr.write('%-6d%-.2f   %.4e   %f   %e    %-8d %f\n' % (iternum, itertime, norm, mean_info, 0, self.quat.num_rot, self.beta.mean()))
         fptr.close()
 
     def _move_to_gpu(self):
