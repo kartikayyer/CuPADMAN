@@ -61,7 +61,8 @@ class EMC():
         self.need_scaling = config.getboolean('emc', 'need_scaling', fallback=False)
         beta_schedule = config.get('emc', 'beta_schedule', fallback='1. 100').split()
         beta_set = config.getfloat('emc', 'beta', fallback=-1.)
-        self.beta_factor = config.getfloat('emc', 'beta_factor', fallback='1.')
+        self.beta_factor = config.getfloat('emc', 'beta_factor', fallback=1.)
+        self.alpha = config.getfloat('emc', 'alpha', fallback=0.)
 
         # Setup reconstruction
         stime = time.time()
@@ -289,7 +290,9 @@ class EMC():
             self.model[self.mweights > 0] /= self.mweights[self.mweights > 0]
 
             self._save_output(iternum)
-            diff = np.linalg.norm(self.model - old_model)
+            diff = np.linalg.norm(self.model - old_model) / self.size**1.5
+            if self.alpha > 0.:
+                self.model = old_model * self.alpha + self.model * (1. - self.alpha)
         else:
             self.comm.Reduce([self.model, MPI.DOUBLE], None, root=0, op=MPI.SUM)
             self.comm.Reduce([self.mweights, MPI.DOUBLE], None, root=0, op=MPI.SUM)
@@ -315,14 +318,14 @@ class EMC():
             fptr.write('System size:\n\tnum_rot = %d\n\tnum_pix = %d/%d\n\tsystem_volume = %d x %d x %d x %d\n\n' % (self.quat.num_rot, (self.det.raw_mask==0).sum(), self.det.num_pix, self.num_modes, self.size, self.size ,self.size))
             fptr.write('Reconstruction parameters:\n\t')
             fptr.write('num_proc = %d\n\t'%self.num_proc)
-            fptr.write('alpha = 0.0\n\t')
-            fptr.write('beta = %f\n\t'%self.beta.mean())
+            fptr.write('alpha = %f\n\t'%self.alpha)
+            fptr.write('beta = %f\n\t'%self.beta_start.mean())
             fptr.write('need_scaling = %s\n\n'%('yes' if self.need_scaling else 'no'))
             fptr.write('Iter  time   rms_change   info_rate  log-likelihood  num_rot  beta\n')
         else:
             fptr = open(self.log_file, 'a')
 
-        mean_info = self.mutual_info.sum() / (self.dset.num_data - self.num_blacklist)
+        mean_info = self.mutual_info[self.blacklist.get()==0].mean()
         fptr.write('%-6d%-.2f   %.4e   %f   %e    %-8d %f\n' % (iternum, itertime, norm, mean_info, 0, self.quat.num_rot, self.beta.mean()))
         fptr.close()
 
