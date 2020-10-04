@@ -59,6 +59,9 @@ class EMC():
         blacklist_fname = os.path.join(config_dir,
             config.get('emc', 'blacklist_file', fallback=''))
         self.need_scaling = config.getboolean('emc', 'need_scaling', fallback=False)
+        beta_schedule = config.get('emc', 'beta_schedule', fallback='1. 100').split()
+        beta_set = config.getfloat('emc', 'beta', fallback=-1.)
+        self.beta_factor = config.getfloat('emc', 'beta_factor', fallback='1.')
 
         # Setup reconstruction
         stime = time.time()
@@ -100,10 +103,16 @@ class EMC():
         if self.need_scaling:
             self.dset.calc_frame_counts()
             self.scales = cp.array(self.dset.fcounts) / self.dset.mean_count
-            self.beta_start = cp.array(np.exp(-6.5 * pow(self.dset.fcounts * 1.e-5, 0.15))) # Empirical
+            if beta_set >= 0.:
+                self.beta_start = cp.full(self.dset.num_data, beta_set)
+            else:
+                self.beta_start = cp.array(np.exp(-6.5 * pow(self.dset.fcounts * 1.e-5, 0.15))) # Empirical
         else:
             self.scales = cp.ones(self.dset.num_data, dtype='f8')
-            self.beta_start = cp.array(np.exp(-6.5 * pow(np.ones(self.dset.num_data)*self.dset.mean_count * 1.e-5, 0.15))) # Empirical
+            if beta_set >= 0.:
+                self.beta_start = cp.full(self.dset.num_data, beta_set)
+            else:
+                self.beta_start = cp.array(np.exp(-6.5 * pow(np.ones(self.dset.num_data)*self.dset.mean_count * 1.e-5, 0.15))) # Empirical
         self._log_print('Starting average beta = %f' % self.beta_start.mean())
         if blacklist_fname == config_dir:
             self.blacklist = cp.zeros(self.dset.num_data, dtype='u1')
@@ -112,6 +121,8 @@ class EMC():
             assert self.blacklist.shape[0] == self.dset.num_data
         self.num_blacklist = self.blacklist.sum()
         self._log_print('%d/%d blacklisted frames'%(self.num_blacklist, self.dset.num_data))
+        self.beta_jump = float(beta_schedule[0])
+        self.beta_period = int(beta_schedule[1])
         self.prob = cp.array([])
 
         self.bsize_pixel = int(np.ceil(self.det.num_pix/32.))
@@ -141,8 +152,9 @@ class EMC():
         views = cp.empty((self.num_streams, self.det.num_pix), dtype='f8')
         dmodel = cp.array(self.model)
         dmweights = cp.array(self.mweights)
-        factor = 2 ** ((iternum-1) // 10)
-        self.beta = self.beta_start * factor
+        curr_factor = self.beta_jump ** ((iternum-1) // self.beta_period) * self.beta_factor
+        self.beta = self.beta_start * curr_factor
+        cp.clip(self.beta, 0., 1., self.beta)
         #mp = cp.get_default_memory_pool()
         #print('Mem usage: %.2f MB / %.2f MB' % (mp.total_bytes()/1024**2, self.mem_size/1024**2))
         self._calculate_rescale(dmodel, views)
