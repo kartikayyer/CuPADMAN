@@ -31,6 +31,7 @@ class EMC():
 
         One can just use run_iteration() after this
         '''
+        stime = time.time()
         # Get system properties
         self.num_streams = num_streams
         self.comm = MPI.COMM_WORLD
@@ -80,17 +81,15 @@ class EMC():
         self.k_calc_prob_all = kernels.get_function('calc_prob_all')
         self.k_merge_all = kernels.get_function('merge_all')
 
-        if self.rank == 0:
-            print('%d frames with %.3f photons/frame (%.3f s) (%.2f MB)' % \
-                    (self.dset.num_data, self.dset.mean_count, etime-stime, self.dset_mem/1024**2))
-            sys.stdout.flush()
+        self._log_print('%d frames with %.3f photons/frame (%.3f s) (%.2f MB)' % \
+                        (self.dset.num_data, self.dset.mean_count, etime-stime, self.dset_mem/1024**2))
         self.model = np.empty(3*(self.size,))
         if self.rank == 0:
             if model_fname is None:
-                print('Random start')
+                self._log_print('Random start')
                 self.model[:] = np.random.random((self.size,)*3) * self.dset.mean_count / self.dset.num_pix
             else:
-                print('Parsing model from', model_fname)
+                self._log_print('Starting from %s'%model_fname)
                 with h5py.File(model_fname, 'r') as fptr:
                     self.model[:] = fptr['intens'][0]
                 #self.model[:] = np.load(model_fname)
@@ -103,12 +102,13 @@ class EMC():
         else:
             self.scales = cp.ones(self.dset.num_data, dtype='f8')
             self.beta_start = cp.array(np.exp(-6.5 * pow(np.ones(self.dset.num_data)*self.dset.mean_count * 1.e-5, 0.15))) # Empirical
-        print('Starting beta =', self.beta_start.mean())
+        self._log_print('Starting average beta = %f' % self.beta_start.mean())
         self.prob = cp.array([])
 
         self.bsize_pixel = int(np.ceil(self.det.num_pix/32.))
         self.bsize_data = int(np.ceil(self.dset.num_data/32.))
         self.stream_list = [cp.cuda.Stream() for _ in range(self.num_streams)]
+        self._log_print('Completed setup: %f s' % (time.time() - stime), all_ranks=True)
 
     def run_iteration(self, iternum=1):
         '''Run one iterations of EMC algorithm
@@ -119,13 +119,13 @@ class EMC():
         Current guess is assumed to be in self.model, which is updated. If scaling is included,
         the scale factors are in self.scales.
         '''
-
         stime = time.time()
         mem_frac = self.quat.num_rot_p*self.dset.num_data*8/ (self.mem_size - self.dset_mem)
         num_blocks = int(np.ceil(mem_frac / MEM_THRESH))
         block_sizes = np.array([self.dset.num_data // num_blocks] * num_blocks)
         block_sizes[0:self.dset.num_data % num_blocks] += 1
-        if len(block_sizes) > 1 and self.rank == 0: print(block_sizes, 'frames in each block')
+        if len(block_sizes) > 1: 
+            self._log_print('%d blocks with {} frames in each block' % (len(block_sizes), block_sizes))
 
         if self.prob.shape != (self.quat.num_rot_p, block_sizes.max()):
             self.prob = cp.empty((self.quat.num_rot_p, block_sizes.max()), dtype='f8')
@@ -147,10 +147,12 @@ class EMC():
             b_start += b
         diff = self._normalize_model(dmodel, dmweights, iternum)
         etime = time.time()
+        self._log_print('Completed maximize: %f s' % (etime-stime))
         if self.rank == 0:
             self._write_log(iternum, etime-stime, diff)
 
     def _calculate_rescale(self, dmodel, views):
+        stime = time.time()
         self.vsum = cp.zeros(self.quat.num_rot, dtype='f8')
         total = 0.
 
@@ -167,9 +169,10 @@ class EMC():
         cp.cuda.Stream().null.use()
 
         self.rescale = self.dset.mean_count / total
-        #print('rescale =', self.rescale)
+        self._log_print('\trescale\t%f (= %f)'%(time.time() - stime, self.rescale))
 
     def _calculate_prob(self, dmodel, views, drange):
+        stime = time.time()
         s = drange[0]
         e = drange[1]
         num_data_b = e - s
@@ -192,10 +195,14 @@ class EMC():
                      self.ones_accum[s:e], self.multi_accum[s:e],
                      self.place_ones, self.place_multi, self.count_multi,
                      self.dmask, initval, self.scales[s:e], self.prob[i]))
+            if (r % (self.quat.num_rot // 10) == 0):
+                self._log_print('\t\tFinished r = %d/%d'%(r, self.quat.num_rot), all_ranks=True)
         [s.synchronize() for s in self.stream_list]
         cp.cuda.Stream().null.use()
+        self._log_print('\tprob\t%f'%(time.time() - stime))
 
     def _normalize_prob(self):
+        stime = time.time()
         max_exp_p = self.prob.max(0).get()
         rmax_p = (self.prob.argmax(axis=0) * self.num_proc + self.rank).astype('i4').get()
         max_exp = np.empty_like(max_exp_p)
@@ -212,7 +219,15 @@ class EMC():
         self.comm.Allreduce([psum_p, MPI.DOUBLE], [psum, MPI.DOUBLE], op=MPI.SUM)
         self.prob = cp.divide(self.prob, cp.array(psum), self.prob)
 
+        #priv->likelihood[d] += prob[d][ind] * (temp - frames->sum_fact[d]) ;
+        info_p = (self.prob * cp.log(self.prob / self.quats[self.rank::self.num_proc, 4][:,cp.newaxis])).sum(0).get()
+        self.mutual_info = np.empty(self.dset.num_data)
+        self.comm.Allreduce([info_p, MPI.DOUBLE], [self.mutual_info, MPI.DOUBLE], op=MPI.SUM)
+
+        self._log_print('\tnorm\t%f'%(time.time() - stime))
+
     def _update_model(self, views, dmodel, dmweights, drange):
+        stime = time.time()
         p_norm = self.prob.sum(1)
         h_p_norm = p_norm.get()
         s = drange[0]
@@ -239,10 +254,14 @@ class EMC():
                     (views[snum], self.quats[r],
                      self.pixvals, self.dmask, self.det.num_pix,
                      self.size, dmodel, dmweights))
+            if (r % (self.quat.num_rot // 10) == 0):
+                self._log_print('\t\tFinished r = %d/%d'%(r, self.quat.num_rot), all_ranks=True)
         [s.synchronize() for s in self.stream_list]
         cp.cuda.Stream().null.use()
+        self._log_print('\tupdate\t%f'%(time.time() - stime))
 
     def _normalize_model(self, dmodel, dmweights, iternum):
+        stime = time.time()
         old_model = np.copy(self.model)
         self.model = dmodel.get()
         self.mweights = dmweights.get()
@@ -258,6 +277,7 @@ class EMC():
             self.comm.Reduce([self.mweights, MPI.DOUBLE], None, root=0, op=MPI.SUM)
             diff = 0.
         self.comm.Bcast([self.model, MPI.DOUBLE], root=0)
+        self._log_print('\tsync\t%f'%(time.time() - stime))
         return diff
 
     def _save_output(self, iternum):
@@ -266,6 +286,7 @@ class EMC():
         fptr['inter_weight'] = self.mweights[np.newaxis]
         fptr['orientations'] = self.rmax
         fptr['scale'] = self.scales.get()
+        fptr['mutual_info'] = self.mutual_info
         fptr.close()
 
     def _write_log(self, iternum, itertime, norm):
@@ -273,17 +294,17 @@ class EMC():
             fptr = open(self.log_file, 'w')
             fptr.write('Cryptotomography with the EMC algorithm using MPI+CUDA\n\n')
             fptr.write('Data parameters:\n\tnum_data = %d\n\tmean_count = %f\n\n' % (self.dset.num_data, self.dset.mean_count))
-            fptr.write('System size:\n\tnum_rot = %d\n\tnum_pix = %d/%d\n\tvolume = %d x %d x %d x %d\n\n' % (self.quat.num_rot, (self.det.raw_mask==0).sum(), self.det.num_pix, self.num_modes, self.size, self.size ,self.size))
+            fptr.write('System size:\n\tnum_rot = %d\n\tnum_pix = %d/%d\n\tsystem_volume = %d x %d x %d x %d\n\n' % (self.quat.num_rot, (self.det.raw_mask==0).sum(), self.det.num_pix, self.num_modes, self.size, self.size ,self.size))
             fptr.write('Reconstruction parameters:\n\t')
             fptr.write('num_proc = %d\n\t'%self.num_proc)
             fptr.write('alpha = 0.0\n\t')
             fptr.write('beta = %f\n\t'%self.beta.mean())
             fptr.write('need_scaling = %s\n\n'%('yes' if self.need_scaling else 'no'))
-            fptr.write('Iter  time     rms_change   info_rate  log-likelihood  num_rot  beta\n')
+            fptr.write('Iter  time   rms_change   info_rate  log-likelihood  num_rot  beta\n')
         else:
             fptr = open(self.log_file, 'a')
 
-        fptr.write('%-6d%-.2e %e %f   %e    %-8d %f\n' % (iternum, itertime, norm, 0, 0, self.quat.num_rot, self.beta.mean()))
+        fptr.write('%-6d%-.2f   %.4e   %f   %e    %-8d %f\n' % (iternum, itertime, norm, self.mutual_info.mean(), 0, self.quat.num_rot, self.beta.mean()))
         fptr.close()
 
     def _move_to_gpu(self):
@@ -302,6 +323,11 @@ class EMC():
         self.place_multi = cp.array(self.dset.place_multi)
         self.count_multi = cp.array(self.dset.count_multi)
         self.dset_mem = cp.get_default_memory_pool().used_bytes() - init_mem
+
+    def _log_print(self, string, all_ranks=False):
+        if all_ranks or self.rank == 0:
+            sys.stderr.write(string+'\n')
+            sys.stderr.flush()
 
 def main():
     '''Parses command line arguments and launches EMC reconstruction'''
@@ -335,25 +361,9 @@ def main():
         cp.cuda.Device(int(dev[rank])).use()
 
     recon = EMC(args.config_file, num_streams=args.streams)
-    if rank == 0:
-        print('\nIter  time(s)  change       beta')
-        sys.stdout.flush()
-        avgtime = 0.
-        numavg = 0
     for i in range(args.num_iter):
-        m0 = cp.array(recon.model)
-        stime = time.time()
         recon.run_iteration(i+1)
-        etime = time.time()
-        if rank == 0:
-            norm = float(cp.linalg.norm(cp.array(recon.model) - m0))
-            print('%-6d%-.2e %e %e' % (i+1, etime-stime, norm, recon.beta.mean()))
-            sys.stdout.flush()
-            if i > 0:
-                avgtime += etime-stime
-                numavg += 1
-    if rank == 0 and numavg > 0:
-        print('%.4e s/iteration on average' % (avgtime / numavg))
+    recon._log_print('Finished all iterations')
 
 if __name__ == '__main__':
     main()
