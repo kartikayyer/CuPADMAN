@@ -26,7 +26,7 @@ class EMC():
     The appropriate CUDA device must be selected before initializing the class.
     Can be used with mpirun, in which case work will be divided among ranks.
     '''
-    def __init__(self, config_file, num_streams=4):
+    def __init__(self, config_file, resume=False, num_streams=4):
         '''Parse config file and setup reconstruction
 
         One can just use run_iteration() after this
@@ -58,6 +58,8 @@ class EMC():
             config.get('emc', 'start_model_file', fallback=''))
         blacklist_fname = os.path.join(config_dir,
             config.get('emc', 'blacklist_file', fallback=''))
+        scale_fname = os.path.join(config_dir,
+            config.get('emc', 'scale_file', fallback=''))
         self.need_scaling = config.getboolean('emc', 'need_scaling', fallback=False)
         beta_schedule = config.get('emc', 'beta_schedule', fallback='1. 100').split()
         beta_set = config.getfloat('emc', 'beta', fallback=-1.)
@@ -65,9 +67,22 @@ class EMC():
         self.alpha = config.getfloat('emc', 'alpha', fallback=0.)
         sel_string = config.get('emc', 'selection', fallback='')
 
-        # Setup reconstruction
-        stime = time.time()
+        # Adjust parameters if resuming reconstruction
+        if resume:
+            try:
+                with open(self.log_file, 'r') as fptr:
+                    self.last_iternum = int(fptr.readlines()[-1].split()[0])
+                print('Resuming from iteration %d'%(self.last_iternum + 1))
+                model_fname = self.output_folder + '/output_%.3d.h5'%self.last_iternum
+                if self.need_scaling:
+                    scale_fname = self.output_folder + '/output_%.3d.h5'%self.last_iternum
+            except (FileNotFoundError, ValueError):
+                print('WARNING: Unable to resume using %s'%self.log_file)
+                self.last_iternum = 0
+        else:
+            self.last_iternum = 0
 
+        # Setup reconstruction
         # -- Generate detector, dataset, quaternions
         # -- Note the following three structs have data in CPU memory
         self.det = Detector(detector_fname)
@@ -104,13 +119,20 @@ class EMC():
         self.mweights = np.zeros(3*(self.size,))
         if self.need_scaling:
             self.dset.calc_frame_counts()
-            self.scales = cp.array(self.dset.fcounts) / self.dset.mean_count
+            if scale_fname == config_dir:
+                self.scales = cp.array(self.dset.fcounts) / self.dset.mean_count
+            else:
+                with h5py.File(scale_fname) as fptr:
+                    self.scales = f['scale'][:]
+                assert self.scales.shape[0] == self.dset.num_data
             if beta_set >= 0.:
                 self.beta_start = cp.full(self.dset.num_data, beta_set)
             else:
                 self.beta_start = cp.array(np.exp(-6.5 * pow(self.dset.fcounts * 1.e-5, 0.15))) # Empirical
         else:
             self.scales = cp.ones(self.dset.num_data, dtype='f8')
+            if scale_fname != config_dir:
+                print('WARNING: scale_file parameter not used as need_scaling is False')
             if beta_set >= 0.:
                 self.beta_start = cp.full(self.dset.num_data, beta_set)
             else:
@@ -156,7 +178,7 @@ class EMC():
         num_blocks = int(np.ceil(mem_frac / MEM_THRESH))
         block_sizes = np.array([self.dset.num_data // num_blocks] * num_blocks)
         block_sizes[0:self.dset.num_data % num_blocks] += 1
-        if len(block_sizes) > 1: 
+        if len(block_sizes) > 1:
             self._log_print('%d blocks with {} frames in each block' % (len(block_sizes), block_sizes))
 
         if self.prob.shape != (self.quat.num_rot_p, block_sizes.max()):
@@ -376,6 +398,8 @@ def main():
                         help='Number of iterations')
     parser.add_argument('-c', '--config_file', default='config.ini',
                         help='Path to configuration file (default: config.ini)')
+    parser.add_argument('-r', '--resume', action='store_true',
+                        help='Resume reconstruction')
     parser.add_argument('-d', '--devices', default=None,
                         help='Comma-separated list of device numbers')
     parser.add_argument('-s', '--streams', type=int, default=4,
@@ -399,9 +423,9 @@ def main():
             sys.exit(1)
         cp.cuda.Device(int(dev[rank])).use()
 
-    recon = EMC(args.config_file, num_streams=args.streams)
+    recon = EMC(args.config_file, resume=args.resume, num_streams=args.streams)
     for i in range(args.num_iter):
-        recon.run_iteration(i+1)
+        recon.run_iteration(recon.last_iternum + i + 1)
     recon._log_print('Finished all iterations')
 
 if __name__ == '__main__':
