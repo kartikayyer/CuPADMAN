@@ -206,7 +206,7 @@ class EMC():
         etime = time.time()
         self._log_print('Completed maximize: %f s' % (etime-stime))
         if self.rank == 0:
-            self._write_log(iternum, etime-stime, diff)
+            self._write_log_file(iternum, etime-stime, diff)
 
     def _calculate_rescale(self, dmodel, views):
         stime = time.time()
@@ -349,8 +349,20 @@ class EMC():
         fptr['mutual_info'] = self.mutual_info
         fptr.close()
 
-    def _write_log(self, iternum, itertime, norm):
+    def _write_log_file(self, iternum, itertime, norm):
         if iternum == 1:
+            if os.path.exists(self.log_file):
+                i = 1
+                dirname = os.path.dirname(self.log_file)
+                basename = os.path.basename(self.log_file)
+                while True:
+                    bak_fname = os.path.join(dirname, '.%s.bak%d'%(basename, i))
+                    if os.path.exists(bak_fname):
+                        i += 1
+                    else:
+                        break
+                self._log_print('Copying old log file to %s'%bak_fname)
+                os.system('cp %s %s' % (self.log_file, bak_fname))
             fptr = open(self.log_file, 'w')
             fptr.write('Cryptotomography with the EMC algorithm using MPI+CUDA\n\n')
             fptr.write('Data parameters:\n\tnum_data = %d/%d\n\tmean_count = %f\n\n' % (self.dset.num_data-self.num_blacklist, self.dset.num_data, self.dset.mean_count))
