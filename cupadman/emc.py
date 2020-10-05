@@ -63,6 +63,7 @@ class EMC():
         beta_set = config.getfloat('emc', 'beta', fallback=-1.)
         self.beta_factor = config.getfloat('emc', 'beta_factor', fallback=1.)
         self.alpha = config.getfloat('emc', 'alpha', fallback=0.)
+        sel_string = config.get('emc', 'selection', fallback='')
 
         # Setup reconstruction
         stime = time.time()
@@ -115,17 +116,27 @@ class EMC():
             else:
                 self.beta_start = cp.array(np.exp(-6.5 * pow(np.ones(self.dset.num_data)*self.dset.mean_count * 1.e-5, 0.15))) # Empirical
         self._log_print('Starting average beta = %f' % self.beta_start.mean())
+
+        # -- Generate blacklist
         if blacklist_fname == config_dir:
             self.blacklist = cp.zeros(self.dset.num_data, dtype='u1')
         else:
             self.blacklist = cp.array(np.loadtxt(blacklist_fname, dtype='u1'))
             assert self.blacklist.shape[0] == self.dset.num_data
+        if sel_string == 'odd_only':
+            self.blacklist[np.where(self.blacklist==0)[0][::2]] = 1
+        elif sel_string == 'even_only':
+            self.blacklist[np.where(self.blacklist==0)[0][1::2]] = 1
+        elif sel_string != '':
+            raise ValueError('Selection string must be odd_onlu or even_only')
         self.num_blacklist = self.blacklist.sum()
         self._log_print('%d/%d blacklisted frames'%(self.num_blacklist, self.dset.num_data))
+
+        # -- Initialize other attributes
         self.beta_jump = float(beta_schedule[0])
         self.beta_period = int(beta_schedule[1])
+        self.known_scale = False
         self.prob = cp.array([])
-
         self.bsize_pixel = int(np.ceil(self.det.num_pix/32.))
         self.bsize_data = int(np.ceil(self.dset.num_data/32.))
         self.stream_list = [cp.cuda.Stream() for _ in range(self.num_streams)]
@@ -159,6 +170,8 @@ class EMC():
         #mp = cp.get_default_memory_pool()
         #print('Mem usage: %.2f MB / %.2f MB' % (mp.total_bytes()/1024**2, self.mem_size/1024**2))
         self._calculate_rescale(dmodel, views)
+        if iternum > 1 and self.need_scaling:
+            self.known_scale = True
 
         b_start = 0
         for b in block_sizes:
@@ -207,13 +220,17 @@ class EMC():
                     (dmodel, self.quats[r], self.pixvals,
                      self.dmask, 1., self.det.num_pix,
                      self.size, views[snum]))
-            initval = float(cp.log(self.quats[r,4]) - self.vsum[r] * self.rescale)
+            if self.need_scaling and self.known_scale:
+                initvals = cp.log(self.quats[r,4]) - self.vsum[r] * cp.full(self.rescale, e-s)
+            else:
+                initvals = cp.log(self.quats[r,4]) - self.vsum[r] * self.scales[s:e]
+            #initval = float(cp.log(self.quats[r,4]) - self.vsum[r] * self.rescale)
             self.k_calc_prob_all((self.bsize_data,), (32,),
                     (views[snum], num_data_b, self.blacklist[s:e],
                      self.ones[s:e], self.multi[s:e],
                      self.ones_accum[s:e], self.multi_accum[s:e],
                      self.place_ones, self.place_multi, self.count_multi,
-                     self.dmask, initval, self.scales[s:e], self.prob[i]))
+                     self.dmask, initvals, self.prob[i]))
             if (r % (self.quat.num_rot // 10) == 0):
                 self._log_print('\t\tFinished r = %d/%d'%(r, self.quat.num_rot), all_ranks=True)
         [s.synchronize() for s in self.stream_list]

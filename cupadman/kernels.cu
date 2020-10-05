@@ -139,7 +139,7 @@ void slice_merge(const double *view, const double *quat, const double *pixvals, 
 __global__
 void calc_prob_all(const double *lview, const long long ndata, const uint8_t *blacklist, const int *ones, const int *multi,
                    const long long *o_acc, const long long *m_acc, const int *p_o, const int *p_m,
-                   const int *c_m, const uint8_t *mask, const double init, const double *scales, double *prob_r) {
+                   const int *c_m, const uint8_t *mask, const double *initvals, double *prob_r) {
 	long long d, t ;
 	int pixel ;
 	d = blockDim.x * blockIdx.x + threadIdx.x ;
@@ -148,7 +148,7 @@ void calc_prob_all(const double *lview, const long long ndata, const uint8_t *bl
 	if (blacklist[d] == 1)
 		return ;
 
-	prob_r[d] = init ;
+	prob_r[d] = initvals[d] ;
 	for (t = o_acc[d] ; t < o_acc[d] + ones[d] ; ++t) {
 		pixel = p_o[t] ;
 		if (mask[pixel] < 1)
