@@ -44,8 +44,6 @@ class EMC():
         config.read(config_file)
         config_dir = os.path.dirname(config_file)
 
-        self.num_div = config.getint('emc', 'num_div')
-        self.num_modes = config.getint('emc', 'num_modes', fallback=1)
         detector_fname = os.path.join(config_dir,
             config.get('emc', 'in_detector_file'))
         photons_fname = os.path.join(config_dir,
@@ -61,11 +59,17 @@ class EMC():
         scale_fname = os.path.join(config_dir,
             config.get('emc', 'scale_file', fallback=''))
         self.need_scaling = config.getboolean('emc', 'need_scaling', fallback=False)
+        num_div = config.getint('emc', 'num_div', fallback=0)
+        num_rot2d = config.getint('emc', 'num_rot', fallback=0)
+        self.num_modes = config.getint('emc', 'num_modes', fallback=1)
         beta_schedule = config.get('emc', 'beta_schedule', fallback='1. 100').split()
         beta_set = config.getfloat('emc', 'beta', fallback=-1.)
         self.beta_factor = config.getfloat('emc', 'beta_factor', fallback=1.)
         self.alpha = config.getfloat('emc', 'alpha', fallback=0.)
         sel_string = config.get('emc', 'selection', fallback='')
+        rtype = config.get('emc', 'recon_type', fallback='3d')
+        if rtype not in ['2d', '3d']:
+            raise ValueError('Unsupported recon_type: %s'%rtype)
 
         # Adjust parameters if resuming reconstruction
         if resume:
@@ -87,7 +91,14 @@ class EMC():
         # -- Note the following three structs have data in CPU memory
         self.det = Detector(detector_fname)
         self.dset = CDataset(photons_fname, self.det)
-        self.quat = Quaternion(self.num_div)
+        self.quat = Quaternion(num_div)
+        if rtype == '2d':
+            if num_rot2d == 0:
+                raise ValueError('Need num_rot if recon_type is 2d')
+            temp = np.zeros((num_rot2d, 5))
+            temp[:,0] = np.arange(0, 2.*np.pi, 2.*np.pi/num_rot2d)
+            temp[:,4] = 1. / num_rot2d
+            self.quat.quats = temp
 
         self.quat.divide(self.rank, self.num_proc, self.num_modes)
         self.size = int(2*np.ceil(np.linalg.norm(self.det.qvals, axis=1).max()) + 3)
@@ -100,23 +111,27 @@ class EMC():
         script_dir = os.path.dirname(os.path.abspath(__file__))
         with open(script_dir+'/kernels.cu', 'r') as f:
             kernels = cp.RawModule(code=f.read())
-        self.k_slice_gen = kernels.get_function('slice_gen')
-        self.k_slice_merge = kernels.get_function('slice_merge')
+        self.k_slice_gen = kernels.get_function('slice_gen'+rtype)
+        self.k_slice_merge = kernels.get_function('slice_merge'+rtype)
         self.k_calc_prob_all = kernels.get_function('calc_prob_all')
         self.k_merge_all = kernels.get_function('merge_all')
 
         # -- Generate iterate
-        self.model = np.empty(3*(self.size,))
+        # ---- Model
+        ndim = 3 if rtype == '3d' else 2
+        self.model = np.empty(ndim*(self.size,))
         if self.rank == 0:
-            if model_fname is None:
+            if model_fname == '':
                 self._log_print('Random start')
-                self.model[:] = np.random.random((self.size,)*3) * self.dset.mean_count / self.dset.num_pix
+                self.model[:] = np.random.random((self.size,)*ndim) * self.dset.mean_count / self.dset.num_pix
             else:
                 self._log_print('Starting from %s'%model_fname)
                 with h5py.File(model_fname, 'r') as fptr:
                     self.model[:] = fptr['intens'][0]
         self.comm.Bcast([self.model, MPI.DOUBLE], root=0)
-        self.mweights = np.zeros(3*(self.size,))
+        self.mweights = np.zeros(ndim*(self.size,))
+
+        # ---- Scale and beta factors
         if self.need_scaling:
             self.dset.calc_frame_counts()
             if scale_fname == config_dir:
@@ -162,6 +177,7 @@ class EMC():
         self.bsize_pixel = int(np.ceil(self.det.num_pix/32.))
         self.bsize_data = int(np.ceil(self.dset.num_data/32.))
         self.stream_list = [cp.cuda.Stream() for _ in range(self.num_streams)]
+
         self._log_print('Completed setup: %f s' % (time.time() - stime), all_ranks=True)
 
     def run_iteration(self, iternum=1):
