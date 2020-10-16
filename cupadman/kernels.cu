@@ -32,14 +32,25 @@ void gen_rot(const double quaternion[4], double rot[3][3]) {
 	rot[2][2] = (1. - 2.*(q11 + q22)) ;
 }
 
+__device__
+void gen_rot2d(const double angle, double rot[2][2]) {
+	double c = cos(angle) ;
+	double s = sin(angle) ;
+
+	rot[0][0] = c ;
+	rot[0][1] = -s ;
+	rot[1][0] = s ;
+	rot[1][1] = c ;
+}
+
 __global__
-void slice_gen(const double *model, const double *quat, const double *pixvals, const uint8_t *mask,
-               const double scale, const long long num_pix, const long long size, double *view) {
+void slice_gen3d(const double *model, const double *quat, const double *pixvals, const uint8_t *mask,
+                 const double scale, const long long num_pix, const long long size, double *view) {
 	int t = blockIdx.x * blockDim.x + threadIdx.x ;
-	int i, j, cen = size/2 ;
-	double rot_pix[3], rot[3][3] ;
 	if (t >= num_pix)
 		return ;
+	int i, j, cen = size/2 ;
+	double rot_pix[3], rot[3][3] ;
 
 	gen_rot(quat, rot) ;
 
@@ -83,7 +94,51 @@ void slice_gen(const double *model, const double *quat, const double *pixvals, c
 }
 
 __global__
-void slice_merge(const double *view, const double *quat, const double *pixvals, const uint8_t *mask,
+void slice_gen2d(const double *model, const double *quat, const double *pixvals, const uint8_t *mask,
+                 const double scale, const long long num_pix, const long long size, double *view) {
+	int t = blockIdx.x * blockDim.x + threadIdx.x ;
+	if (t >= num_pix)
+		return ;
+	int i, j, cen = size/2 ;
+	double rot_pix[2], rot[2][2] ;
+
+	gen_rot2d(quat[0], rot) ;
+
+	for (i = 0 ; i < 2 ; ++i) {
+		rot_pix[i] = 0. ;
+		for (j = 0 ; j < 2 ; ++j)
+			rot_pix[i] += rot[i][j] * pixvals[t*4 + j] ;
+		rot_pix[i] += cen ;
+	}
+
+	int ix = __double2int_rd(rot_pix[0]) ;
+	int iy = __double2int_rd(rot_pix[1]) ;
+	if (ix < 0 || ix > size - 2 || iy < 0 || iy > size - 2) {
+		if (scale != 0.)
+			view[t] = -1.0e20 ;
+		else
+			view[t] = 0. ;
+
+		return ;
+	}
+	double fx = rot_pix[0] - ix, fy = rot_pix[1] - iy ;
+	double cx = 1. - fx, cy = 1. - fy ;
+
+	view[t] = cx*cy*model[ix*size + iy] +
+			  cx*fy*model[ix*size + (iy+1)] +
+			  fx*cy*model[(ix+1)*size + iy] +
+			  fx*fy*model[(ix+1)*size + (iy+1)] ;
+	view[t] *= pixvals[t*4 + 3] ;
+	if (scale != 0.) {
+		if (view[t] < 1.e-20)
+			view[t] = -1.0e20 ;
+		else
+			view[t] = log(view[t] * scale) ;
+	}
+}
+
+__global__
+void slice_merge3d(const double *view, const double *quat, const double *pixvals, const uint8_t *mask,
                  const long long num_pix, const long long size, double *model, double *mweights) {
 	int t = blockIdx.x * blockDim.x + threadIdx.x ;
 	if (t >= num_pix)
@@ -134,6 +189,51 @@ void slice_merge(const double *view, const double *quat, const double *pixvals, 
 	atomicAdd(&mweights[(ix+1)*size*size + iy*size + iz+1], fx*cy*fz) ;
 	atomicAdd(&mweights[(ix+1)*size*size + (iy+1)*size + iz], fx*fy*cz) ;
 	atomicAdd(&mweights[(ix+1)*size*size + (iy+1)*size + iz+1], fx*fy*fz) ;
+}
+
+__global__
+void slice_merge2d(const double *view, const double *quat, const double *pixvals, const uint8_t *mask,
+                 const long long num_pix, const long long size, double *model, double *mweights) {
+	int t = blockIdx.x * blockDim.x + threadIdx.x ;
+	if (t >= num_pix)
+		return ;
+
+	// Skip over bad pixels
+	if (mask[t] > 1)
+		return ;
+
+	int i, j, cen = size/2 ;
+	double rot_pix[2], rot[2][2] ;
+	if (t >= num_pix)
+		return ;
+
+	gen_rot2d(quat[0], rot) ;
+
+	for (i = 0 ; i < 2 ; ++i) {
+		rot_pix[i] = 0. ;
+		for (j = 0 ; j < 2 ; ++j)
+			rot_pix[i] += rot[i][j] * pixvals[t*4 + j] ;
+		rot_pix[i] += cen ;
+	}
+
+	int ix = __double2int_rd(rot_pix[0]) ;
+	int iy = __double2int_rd(rot_pix[1]) ;
+	if (ix < 0 || ix > size - 2 || iy < 0 || iy > size - 2)
+		return ;
+
+	double fx = rot_pix[0] - ix, fy = rot_pix[1] - iy ;
+	double cx = 1. - fx, cy = 1. - fy ;
+	double val = view[t] / pixvals[t*4 + 3] ;
+
+	atomicAdd(&model[ix*size + iy], val*cx*cy) ;
+	atomicAdd(&model[ix*size + (iy+1)], val*cx*fy) ;
+	atomicAdd(&model[(ix+1)*size + iy], val*fx*cy) ;
+	atomicAdd(&model[(ix+1)*size + (iy+1)], val*fx*fy) ;
+
+	atomicAdd(&mweights[ix*size + iy], cx*cy) ;
+	atomicAdd(&mweights[ix*size + (iy+1)], cx*fy) ;
+	atomicAdd(&mweights[(ix+1)*size + iy], fx*cy) ;
+	atomicAdd(&mweights[(ix+1)*size + (iy+1)], fx*fy) ;
 }
 
 __global__
