@@ -167,5 +167,15 @@ cdef class Quaternion:
     @property
     def octahedral_flag(self): return bool(self.quat.octahedral_flag)
     @property
-    def quats(self): return np.asarray(<double[:self.num_rot*5]> self.quat.quats).reshape(-1,5)
+    def quats(self): return np.asarray(<double[:self.num_rot*5]> self.quat.quats).reshape(-1,5) if self.quat.quats != NULL else None
+    @quats.setter
+    def quats(self, arr):
+        if len(arr.shape) != 2 or arr.shape[1] != 5:
+            raise ValueError('quats must be  2D array of shape (N, 5)')
+        if arr.dtype != 'f8':
+            raise TypeError('quats must be double precision floats (float64)')
 
+        self.quat.quats = <double*> malloc(arr.size * sizeof(double))
+        for i in range(arr.size):
+            self.quat.quats[i] = arr.ravel()[i]
+        self.quat.num_rot = arr.shape[0]
