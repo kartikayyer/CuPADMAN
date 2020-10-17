@@ -92,6 +92,7 @@ class EMC():
         self.det = Detector(detector_fname)
         self.dset = CDataset(photons_fname, self.det)
         self.quat = Quaternion(num_div)
+
         if rtype == '2d':
             if num_rot2d == 0:
                 raise ValueError('Need num_rot if recon_type is 2d')
@@ -100,8 +101,12 @@ class EMC():
             temp[:,4] = 1. / num_rot2d
             self.quat.quats = temp
 
+            self.size = int(2.*np.ceil(np.sqrt(self.det.cx**2 + self.det.cy**2).max()) + 3)
+        else:
+            self.size = int(2*np.ceil(np.linalg.norm(self.det.qvals, axis=1).max()) + 3)
+        self._log_print('Calculated volume size = %ld'%self.size) ;
+
         self.quat.divide(self.rank, self.num_proc, self.num_modes)
-        self.size = int(2*np.ceil(np.linalg.norm(self.det.qvals, axis=1).max()) + 3)
         self._move_to_gpu()
 
         self._log_print('%d frames with %.3f photons/frame (%.3f s) (%.2f MB)' % \
@@ -119,17 +124,18 @@ class EMC():
         # -- Generate iterate
         # ---- Model
         ndim = 3 if rtype == '3d' else 2
-        self.model = np.empty(ndim*(self.size,))
+        mshape = (self.num_modes,) + ndim * (self.size,)
+        self.model = np.empty(mshape)
         if self.rank == 0:
             if model_fname == '':
                 self._log_print('Random start')
-                self.model[:] = np.random.random((self.size,)*ndim) * self.dset.mean_count / self.dset.num_pix
+                self.model[:] = np.random.random(mshape) * self.dset.mean_count / self.dset.num_pix
             else:
                 self._log_print('Starting from %s'%model_fname)
                 with h5py.File(model_fname, 'r') as fptr:
-                    self.model[:] = fptr['intens'][0]
+                    self.model[:] = fptr['intens'][:]
         self.comm.Bcast([self.model, MPI.DOUBLE], root=0)
-        self.mweights = np.zeros(ndim*(self.size,))
+        self.mweights = np.zeros(mshape)
 
         # ---- Scale and beta factors
         if self.need_scaling:
@@ -226,18 +232,20 @@ class EMC():
 
     def _calculate_rescale(self, dmodel, views):
         stime = time.time()
-        self.vsum = cp.zeros(self.quat.num_rot, dtype='f8')
+        self.vsum = cp.zeros(self.quat.num_rot*self.num_modes, dtype='f8')
         total = 0.
 
-        for i, r in enumerate(range(self.rank, self.quat.num_rot, self.num_proc)):
+        for i, r in enumerate(range(self.rank, self.quat.num_rot*self.num_modes, self.num_proc)):
             snum = i % self.num_streams
+            modenum = i // self.quat.num_rot
+            rotind = i % self.quat.num_rot
             self.stream_list[snum].use()
             self.k_slice_gen((self.bsize_pixel,), (32,),
-                    (dmodel, self.quats[r], self.pixvals,
+                    (dmodel[modenum], self.quats[rotind], self.pixvals,
                      self.dmask, 0., self.det.num_pix,
                      self.size, views[snum]))
             self.vsum[r] = views[snum][self.det.raw_mask==0].sum()
-            total += self.vsum[r] * self.quat.quats[r,4]
+            total += self.vsum[r] * self.quat.quats[rotind,4]
         [s.synchronize() for s in self.stream_list]
         cp.cuda.Stream().null.use()
 
@@ -251,17 +259,19 @@ class EMC():
         num_data_b = e - s
         self.bsize_data = int(np.ceil(num_data_b/32.))
 
-        for i, r in enumerate(range(self.rank, self.quat.num_rot, self.num_proc)):
+        for i, r in enumerate(range(self.rank, self.quat.num_rot*self.num_modes, self.num_proc)):
             snum = i % self.num_streams
+            modenum = i // self.quat.num_rot
+            rotind = i % self.quat.num_rot
             self.stream_list[snum].use()
             self.k_slice_gen((self.bsize_pixel,), (32,),
-                    (dmodel, self.quats[r], self.pixvals,
+                    (dmodel[modenum], self.quats[rotind], self.pixvals,
                      self.dmask, 1., self.det.num_pix,
                      self.size, views[snum]))
             if self.need_scaling and self.known_scale:
-                initvals = cp.log(self.quats[r,4]) - self.vsum[r] * cp.full(self.rescale, e-s)
+                initvals = cp.log(self.quats[rotind,4]) - self.vsum[r] * cp.full(self.rescale, e-s)
             else:
-                initvals = cp.log(self.quats[r,4]) - self.vsum[r] * self.scales[s:e]
+                initvals = cp.log(self.quats[rotind,4]) - self.vsum[r] * self.scales[s:e]
             #initval = float(cp.log(self.quats[r,4]) - self.vsum[r] * self.rescale)
             self.k_calc_prob_all((self.bsize_data,), (32,),
                     (views[snum], num_data_b, self.blacklist[s:e],
@@ -269,8 +279,8 @@ class EMC():
                      self.ones_accum[s:e], self.multi_accum[s:e],
                      self.place_ones, self.place_multi, self.count_multi,
                      self.dmask, initvals, self.prob[i]))
-            if (r % (self.quat.num_rot // 10) == 0):
-                self._log_print('\t\tFinished r = %d/%d'%(r, self.quat.num_rot), all_ranks=True)
+            if (r % (self.quat.num_rot * self.num_modes // 10) == 0):
+                self._log_print('\t\tFinished r = %d/%d'%(r, self.quat.num_rot*self.num_modes), all_ranks=True)
         [s.synchronize() for s in self.stream_list]
         cp.cuda.Stream().null.use()
         self._log_print('\tprob\t%f'%(time.time() - stime))
@@ -294,7 +304,7 @@ class EMC():
         self.prob = cp.divide(self.prob, cp.array(psum), self.prob)
 
         #priv->likelihood[d] += prob[d][ind] * (temp - frames->sum_fact[d]) ;
-        info_p = (self.prob * cp.log(self.prob / self.quats[self.rank::self.num_proc, 4][:,cp.newaxis])).sum(0).get()
+        info_p = (self.prob * cp.log(self.prob * self.num_modes / cp.tile(self.quats[self.rank::self.num_proc, 4], self.num_modes)[:,cp.newaxis])).sum(0).get()
         self.mutual_info = np.zeros(self.dset.num_data)
         self.comm.Allreduce([info_p, MPI.DOUBLE], [self.mutual_info, MPI.DOUBLE], op=MPI.SUM)
 
@@ -310,10 +320,12 @@ class EMC():
 
         dmodel[:] = 0
         dmweights[:] = 0
-        for i, r in enumerate(range(self.rank, self.quat.num_rot, self.num_proc)):
+        for i, r in enumerate(range(self.rank, self.quat.num_rot*self.num_modes, self.num_proc)):
             if h_p_norm[i] == 0.:
                 continue
             snum = i % self.num_streams
+            modenum = i // self.quat.num_rot
+            rotind = i % self.quat.num_rot
             self.stream_list[snum].use()
             views[snum,:] = 0
             self.k_merge_all((self.bsize_data,), (32,),
@@ -325,11 +337,11 @@ class EMC():
             #views[snum] = views[snum] / p_norm[i] - self.dset.bg
             views[snum] = views[snum] / p_norm[i]
             self.k_slice_merge((self.bsize_pixel,), (32,),
-                    (views[snum], self.quats[r],
+                    (views[snum], self.quats[rotind],
                      self.pixvals, self.dmask, self.det.num_pix,
-                     self.size, dmodel, dmweights))
-            if (r % (self.quat.num_rot // 10) == 0):
-                self._log_print('\t\tFinished r = %d/%d'%(r, self.quat.num_rot), all_ranks=True)
+                     self.size, dmodel[modenum], dmweights[modenum]))
+            if (r % (self.quat.num_rot*self.num_modes // 10) == 0):
+                self._log_print('\t\tFinished r = %d/%d'%(r, self.quat.num_rot*self.num_modes), all_ranks=True)
         [s.synchronize() for s in self.stream_list]
         cp.cuda.Stream().null.use()
         self._log_print('\tupdate\t%f'%(time.time() - stime))
@@ -345,7 +357,7 @@ class EMC():
             self.model[self.mweights > 0] /= self.mweights[self.mweights > 0]
 
             self._save_output(iternum)
-            diff = np.linalg.norm(self.model - old_model) / self.size**1.5
+            diff = np.linalg.norm(self.model - old_model) / self.size**1.5 / self.num_modes**0.5
             if self.alpha > 0.:
                 self.model = old_model * self.alpha + self.model * (1. - self.alpha)
         else:
@@ -358,11 +370,13 @@ class EMC():
 
     def _save_output(self, iternum):
         fptr = h5py.File(self.output_folder + '/output_%.3d.h5'%iternum, 'w')
-        fptr['intens'] = self.model[np.newaxis]
-        fptr['inter_weight'] = self.mweights[np.newaxis]
+        fptr['intens'] = self.model
+        fptr['inter_weight'] = self.mweights
         fptr['orientations'] = self.rmax
         fptr['scale'] = self.scales.get()
         fptr['mutual_info'] = self.mutual_info
+        if self.num_modes > 1:
+            fptr['occupancies'] = self.prob.reshape(self.num_modes, self.quat.num_rot, -1).sum(1).T.get()
         fptr.close()
 
     def _write_log_file(self, iternum, itertime, norm):
