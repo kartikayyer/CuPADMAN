@@ -234,12 +234,11 @@ class EMC():
         total = 0.
 
         for i, r in enumerate(range(self.rank, self.quat.num_rot*self.num_modes, self.num_proc)):
-            #snum = i % self.num_streams
-            snum = 0
-            modenum = r // self.quat.num_rot
-            rotind = r % self.quat.num_rot
+            snum = i % self.num_streams
+            modenum = r % self.num_modes
+            rotind = r // self.num_modes
 
-            #self.stream_list[snum].use()
+            self.stream_list[snum].use()
             self.k_slice_gen((self.bsize_pixel,), (32,),
                     (dmodel[modenum], self.quats[rotind], self.pixvals,
                      self.dmask, 0., self.det.num_pix,
@@ -261,17 +260,18 @@ class EMC():
 
         for i, r in enumerate(range(self.rank, self.quat.num_rot*self.num_modes, self.num_proc)):
             snum = i % self.num_streams
-            modenum = r // self.quat.num_rot
-            rotind = r % self.quat.num_rot
+            modenum = r % self.num_modes
+            rotind = r // self.num_modes
+
             self.stream_list[snum].use()
             self.k_slice_gen((self.bsize_pixel,), (32,),
                     (dmodel[modenum], self.quats[rotind], self.pixvals,
                      self.dmask, 1., self.det.num_pix,
                      self.size, views[snum]))
             if self.need_scaling and self.known_scale:
-                initvals = cp.log(self.quats[rotind,4]) - self.vsum[r] * cp.full(self.rescale, e-s)
-            else:
                 initvals = cp.log(self.quats[rotind,4]) - self.vsum[r] * self.scales[s:e]
+            else:
+                initvals = cp.log(self.quats[rotind,4]) - self.vsum[r] * cp.full((e-s,), self.rescale)
             self.k_calc_prob_all((self.bsize_data,), (32,),
                     (views[snum], num_data_b, self.blacklist[s:e],
                      self.ones[s:e], self.multi[s:e],
@@ -301,6 +301,7 @@ class EMC():
         psum = np.empty_like(psum_p)
         self.comm.Allreduce([psum_p, MPI.DOUBLE], [psum, MPI.DOUBLE], op=MPI.SUM)
         self.prob = cp.divide(self.prob, cp.array(psum), self.prob)
+        #np.save(self.output_folder+'/prob_001.npy', self.prob.get())
 
         rotindarr = cp.arange(self.rank, self.quat.num_rot*self.num_modes, self.num_proc) % self.quat.num_rot
         #priv->likelihood[d] += prob[d][ind] * (temp - frames->sum_fact[d]) ;
@@ -324,8 +325,9 @@ class EMC():
             if h_p_norm[i] == 0.:
                 continue
             snum = i % self.num_streams
-            modenum = r // self.quat.num_rot
-            rotind = r % self.quat.num_rot
+            modenum = r % self.num_modes
+            rotind = r // self.num_modes
+
             self.stream_list[snum].use()
             views[snum,:] = 0
             self.k_merge_all((self.bsize_data,), (32,),
@@ -376,7 +378,8 @@ class EMC():
         fptr['scale'] = self.scales.get()
         fptr['mutual_info'] = self.mutual_info
         if self.num_modes > 1:
-            fptr['occupancies'] = self.prob.reshape(self.num_modes, self.quat.num_rot, -1).sum(1).T.get()
+            fptr['occupancies'] = self.prob.reshape(self.quat.num_rot, self.num_modes, -1).sum(0).T.get()
+            #fptr['occupancies'] = self.prob.reshape(self.num_modes, self.quat.num_rot, -1).sum(1).T.get()
         fptr.close()
 
     def _write_log_file(self, iternum, itertime, norm):
