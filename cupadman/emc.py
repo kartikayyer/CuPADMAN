@@ -13,7 +13,7 @@ import h5py
 from mpi4py import MPI
 import cupy as cp
 
-from cupadman import Detector, CDataset, Quaternion
+from cupadman import CDetector, CDataset, Quaternion
 P_MIN = 1.e-6
 MEM_THRESH = 0.8
 
@@ -89,7 +89,7 @@ class EMC():
         # Setup reconstruction
         # -- Generate detector, dataset, quaternions
         # -- Note the following three structs have data in CPU memory
-        self.det = Detector(detector_fname)
+        self.det = CDetector(detector_fname, twodim=(rtype=='2d'))
         self.dset = CDataset(photons_fname, self.det)
         self.quat = Quaternion(num_div)
 
@@ -101,9 +101,7 @@ class EMC():
             temp[:,4] = 1. / num_rot2d
             self.quat.quats = temp
 
-            self.size = int(2.*np.ceil(np.sqrt(self.det.cx**2 + self.det.cy**2).max()) + 3)
-        else:
-            self.size = int(2*np.ceil(np.linalg.norm(self.det.qvals, axis=1).max()) + 3)
+        self.size = int(2*np.ceil(np.linalg.norm(self.det.qvals, axis=1).max()) + 3)
         self._log_print('Calculated volume size = %ld'%self.size) ;
 
         self.quat.divide(self.rank, self.num_proc, self.num_modes)
@@ -236,10 +234,12 @@ class EMC():
         total = 0.
 
         for i, r in enumerate(range(self.rank, self.quat.num_rot*self.num_modes, self.num_proc)):
-            snum = i % self.num_streams
-            modenum = i // self.quat.num_rot
-            rotind = i % self.quat.num_rot
-            self.stream_list[snum].use()
+            #snum = i % self.num_streams
+            snum = 0
+            modenum = r // self.quat.num_rot
+            rotind = r % self.quat.num_rot
+
+            #self.stream_list[snum].use()
             self.k_slice_gen((self.bsize_pixel,), (32,),
                     (dmodel[modenum], self.quats[rotind], self.pixvals,
                      self.dmask, 0., self.det.num_pix,
@@ -249,8 +249,8 @@ class EMC():
         [s.synchronize() for s in self.stream_list]
         cp.cuda.Stream().null.use()
 
-        self.rescale = self.dset.mean_count / total
-        self._log_print('\trescale\t%f (= %f)'%(time.time() - stime, self.rescale))
+        self.rescale = self.dset.mean_count / total * self.num_modes
+        self._log_print('\trescale\t%f (= %e)'%(time.time() - stime, self.rescale))
 
     def _calculate_prob(self, dmodel, views, drange):
         stime = time.time()
@@ -261,8 +261,8 @@ class EMC():
 
         for i, r in enumerate(range(self.rank, self.quat.num_rot*self.num_modes, self.num_proc)):
             snum = i % self.num_streams
-            modenum = i // self.quat.num_rot
-            rotind = i % self.quat.num_rot
+            modenum = r // self.quat.num_rot
+            rotind = r % self.quat.num_rot
             self.stream_list[snum].use()
             self.k_slice_gen((self.bsize_pixel,), (32,),
                     (dmodel[modenum], self.quats[rotind], self.pixvals,
@@ -272,7 +272,6 @@ class EMC():
                 initvals = cp.log(self.quats[rotind,4]) - self.vsum[r] * cp.full(self.rescale, e-s)
             else:
                 initvals = cp.log(self.quats[rotind,4]) - self.vsum[r] * self.scales[s:e]
-            #initval = float(cp.log(self.quats[r,4]) - self.vsum[r] * self.rescale)
             self.k_calc_prob_all((self.bsize_data,), (32,),
                     (views[snum], num_data_b, self.blacklist[s:e],
                      self.ones[s:e], self.multi[s:e],
@@ -303,8 +302,9 @@ class EMC():
         self.comm.Allreduce([psum_p, MPI.DOUBLE], [psum, MPI.DOUBLE], op=MPI.SUM)
         self.prob = cp.divide(self.prob, cp.array(psum), self.prob)
 
+        rotindarr = cp.arange(self.rank, self.quat.num_rot*self.num_modes, self.num_proc) % self.quat.num_rot
         #priv->likelihood[d] += prob[d][ind] * (temp - frames->sum_fact[d]) ;
-        info_p = (self.prob * cp.log(self.prob * self.num_modes / cp.tile(self.quats[self.rank::self.num_proc, 4], self.num_modes)[:,cp.newaxis])).sum(0).get()
+        info_p = (self.prob * cp.log(self.prob * self.num_modes / self.quats[rotindarr, 4][:,cp.newaxis])).sum(0).get()
         self.mutual_info = np.zeros(self.dset.num_data)
         self.comm.Allreduce([info_p, MPI.DOUBLE], [self.mutual_info, MPI.DOUBLE], op=MPI.SUM)
 
@@ -324,8 +324,8 @@ class EMC():
             if h_p_norm[i] == 0.:
                 continue
             snum = i % self.num_streams
-            modenum = i // self.quat.num_rot
-            rotind = i % self.quat.num_rot
+            modenum = r // self.quat.num_rot
+            rotind = r % self.quat.num_rot
             self.stream_list[snum].use()
             views[snum,:] = 0
             self.k_merge_all((self.bsize_data,), (32,),
@@ -357,7 +357,7 @@ class EMC():
             self.model[self.mweights > 0] /= self.mweights[self.mweights > 0]
 
             self._save_output(iternum)
-            diff = np.linalg.norm(self.model - old_model) / self.size**1.5 / self.num_modes**0.5
+            diff = np.linalg.norm((self.model - old_model).ravel()) / self.size**1.5 / self.num_modes**0.5
             if self.alpha > 0.:
                 self.model = old_model * self.alpha + self.model * (1. - self.alpha)
         else:
@@ -395,8 +395,14 @@ class EMC():
                 os.system('cp %s %s' % (self.log_file, bak_fname))
             fptr = open(self.log_file, 'w')
             fptr.write('Cryptotomography with the EMC algorithm using MPI+CUDA\n\n')
-            fptr.write('Data parameters:\n\tnum_data = %d/%d\n\tmean_count = %f\n\n' % (self.dset.num_data-self.num_blacklist, self.dset.num_data, self.dset.mean_count))
-            fptr.write('System size:\n\tnum_rot = %d\n\tnum_pix = %d/%d\n\tsystem_volume = %d x %d x %d x %d\n\n' % (self.quat.num_rot, (self.det.raw_mask==0).sum(), self.det.num_pix, self.num_modes, self.size, self.size ,self.size))
+            if self.num_blacklist > 0:
+                fptr.write('Data parameters:\n\tnum_data = %d/%d\n\tmean_count = %f\n\n' % (self.dset.num_data-self.num_blacklist, self.dset.num_data, self.dset.mean_count))
+            else:
+                fptr.write('Data parameters:\n\tnum_data = %d\n\tmean_count = %f\n\n' % (self.dset.num_data, self.dset.mean_count))
+            if len(self.model.shape) == 4:
+                fptr.write('System size:\n\tnum_rot = %d\n\tnum_pix = %d/%d\n\tsystem_volume = %d X %d X %d X %d\n\n' % (self.quat.num_rot, (self.det.raw_mask==0).sum(), self.det.num_pix, self.num_modes, self.size, self.size ,self.size))
+            else:
+                fptr.write('System size:\n\tnum_rot = %d\n\tnum_pix = %d/%d\n\tsystem_volume = %d X %d X %d\n\n' % (self.quat.num_rot, (self.det.raw_mask==0).sum(), self.det.num_pix, self.num_modes, self.size ,self.size))
             fptr.write('Reconstruction parameters:\n\t')
             fptr.write('num_proc = %d\n\t'%self.num_proc)
             fptr.write('alpha = %f\n\t'%self.alpha)
