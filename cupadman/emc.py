@@ -301,7 +301,6 @@ class EMC():
         psum = np.empty_like(psum_p)
         self.comm.Allreduce([psum_p, MPI.DOUBLE], [psum, MPI.DOUBLE], op=MPI.SUM)
         self.prob = cp.divide(self.prob, cp.array(psum), self.prob)
-        #np.save(self.output_folder+'/prob_001.npy', self.prob.get())
 
         rotindarr = cp.arange(self.rank, self.quat.num_rot*self.num_modes, self.num_proc) % self.quat.num_rot
         #priv->likelihood[d] += prob[d][ind] * (temp - frames->sum_fact[d]) ;
@@ -359,7 +358,7 @@ class EMC():
             self.model[self.mweights > 0] /= self.mweights[self.mweights > 0]
 
             self._save_output(iternum)
-            diff = np.linalg.norm((self.model - old_model).ravel()) / self.size**1.5 / self.num_modes**0.5
+            diff = np.linalg.norm((self.model - old_model).ravel()) / self.model.size**0.5
             if self.alpha > 0.:
                 self.model = old_model * self.alpha + self.model * (1. - self.alpha)
         else:
