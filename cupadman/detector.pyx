@@ -104,7 +104,7 @@ cdef class CDetector:
         else:
             raise ValueError('Need 3 values on header line: num_pix, detd_pix, ewald_rad_vox')
 
-    def _parse_asciidet(self, norm=True):
+    def _parse_asciidet(self, norm=True, twodim=False):
         print('Parsing ASCII detector file')
         self._check_header()
         dframe = pandas.read_csv(
@@ -117,6 +117,10 @@ cdef class CDetector:
         self.det.num_pix = qx.shape[0]
         if norm:
             np_corr /= np_corr.mean()
+        if twodim:
+            qx *= self.det.detd / (qz + self.det.ewald_rad)
+            qy *= self.det.detd / (qz + self.det.ewald_rad)
+            qz[:] = 0.
 
         cdef int t, d
         cdef double[:,:] qvals = np.copy(np.array([qx, qy, qz]).T)
@@ -132,22 +136,26 @@ cdef class CDetector:
             for d in range(3):
                 self.det.qvals[t*3 + d] = qvals[t, d]
 
-    def _parse_h5det(self, norm=True):
+    def _parse_h5det(self, norm=True, twodim=False):
         print('Parsing HDF5 detector file')
 
         fptr = h5py.File(self.fname, 'r')
+        self.det.detd = fptr['detd'][()]
+        self.det.ewald_rad = fptr['ewald_rad'][()]
         qx, qy, qz = fptr['qx'][:], fptr['qy'][:], fptr['qz'][:]
         cdef double[:] corr = fptr['corr'][:].ravel()
         cdef uint8_t[:] raw_mask = fptr['mask'][:].astype('u1')
-        self.det.detd = fptr['detd'][()]
-        self.det.ewald_rad = fptr['ewald_rad'][()]
         fptr.close()
 
         if norm:
             np_corr = np.asarray(corr)
             np_corr /= np_corr.mean()
+        if twodim:
+            qx *= self.det.detd / (qz + self.det.ewald_rad)
+            qy *= self.det.detd / (qz + self.det.ewald_rad)
+            qz[:] = 0.
 
-        self.det.num_pix = qx.shape[0]
+        self.det.num_pix = qx.size
         cdef double[:,:] qvals = np.ascontiguousarray(np.array([qx, qy, qz]).T).reshape(-1,3)
 
         self.det.qvals = <double*> malloc(self.num_pix * 3 * sizeof(double))
