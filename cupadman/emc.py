@@ -44,21 +44,16 @@ class EMC():
         config.read(config_file)
         config_dir = os.path.dirname(config_file)
 
-        detector_fname = os.path.join(config_dir,
-            config.get('emc', 'in_detector_file'))
-        photons_fname = os.path.join(config_dir,
-            config.get('emc', 'in_photons_file'))
-        self.output_folder = os.path.join(config_dir,
-            config.get('emc', 'output_folder', fallback='data/'))
-        self.log_file = os.path.join(config_dir,
-            config.get('emc', 'log_file', fallback='EMC.log'))
-        model_fname = os.path.join(config_dir,
-            config.get('emc', 'start_model_file', fallback=''))
-        blacklist_fname = os.path.join(config_dir,
-            config.get('emc', 'blacklist_file', fallback=''))
-        scale_fname = os.path.join(config_dir,
-            config.get('emc', 'scale_file', fallback=''))
+        detector_fname = os.path.join(config_dir, config.get('emc', 'in_detector_file'))
+        photons_fname = os.path.join(config_dir, config.get('emc', 'in_photons_file'))
+        self.output_folder = os.path.join(config_dir, config.get('emc', 'output_folder', fallback='data/'))
+        self.log_file = os.path.join(config_dir, config.get('emc', 'log_file', fallback='EMC.log'))
+        model_fname = os.path.join(config_dir, config.get('emc', 'start_model_file', fallback=''))
+        blacklist_fname = os.path.join(config_dir, config.get('emc', 'blacklist_file', fallback=''))
+        scale_fname = os.path.join(config_dir, config.get('emc', 'scale_file', fallback=''))
+
         self.need_scaling = config.getboolean('emc', 'need_scaling', fallback=False)
+        self.update_scale = config.getboolean('emc', 'update_scale', fallback=True)
         num_div = config.getint('emc', 'num_div', fallback=0)
         num_rot2d = config.getint('emc', 'num_rot', fallback=0)
         self.num_modes = config.getint('emc', 'num_modes', fallback=1)
@@ -137,13 +132,17 @@ class EMC():
 
         # ---- Scale and beta factors
         if self.need_scaling:
+            self.known_scale = False
             self.dset.calc_frame_counts()
             if scale_fname == config_dir:
-                self.scales = cp.array(self.dset.fcounts) / self.dset.mean_count
+                #self.scales = cp.array(self.dset.fcounts) / self.dset.mean_count
+                self.scales = cp.ones(self.dset.num_data)
             else:
                 with h5py.File(scale_fname) as fptr:
                     self.scales = f['scale'][:]
                 assert self.scales.shape[0] == self.dset.num_data
+                self.known_scale = True
+
             if beta_set >= 0.:
                 self.beta_start = cp.full(self.dset.num_data, beta_set)
             else:
@@ -152,6 +151,7 @@ class EMC():
             self.scales = cp.ones(self.dset.num_data, dtype='f8')
             if scale_fname != config_dir:
                 print('WARNING: scale_file parameter not used as need_scaling is False')
+
             if beta_set >= 0.:
                 self.beta_start = cp.full(self.dset.num_data, beta_set)
             else:
@@ -169,14 +169,13 @@ class EMC():
         elif sel_string == 'even_only':
             self.blacklist[np.where(self.blacklist==0)[0][1::2]] = 1
         elif sel_string != '':
-            raise ValueError('Selection string must be odd_onlu or even_only')
+            raise ValueError('Selection string must be odd_only or even_only')
         self.num_blacklist = self.blacklist.sum()
         self._log_print('%d/%d blacklisted frames'%(self.num_blacklist, self.dset.num_data))
 
         # -- Initialize other attributes
         self.beta_jump = float(beta_schedule[0])
         self.beta_period = int(beta_schedule[1])
-        self.known_scale = False
         self.prob = cp.array([])
         self.bsize_pixel = int(np.ceil(self.det.num_pix/32.))
         self.bsize_data = int(np.ceil(self.dset.num_data/32.))
@@ -312,11 +311,18 @@ class EMC():
 
     def _update_model(self, views, dmodel, dmweights, drange):
         stime = time.time()
-        p_norm = self.prob.sum(1)
-        h_p_norm = p_norm.get()
         s = drange[0]
         e = drange[1]
         num_data_b = e - s
+
+        if self.need_scaling:
+            p_norm = (self.prob * self.scales[s:e]).sum(1)
+            if self.update_scale:
+                self.scales[s:e] = cp.array(self.dset.fcounts[s:e]) / (self.prob * self.vsum[:, cp.newaxis]).sum(0) / self.rescale
+        else:
+            p_norm = self.prob.sum(1)
+
+        h_p_norm = p_norm.get()
 
         dmodel[:] = 0
         dmweights[:] = 0
@@ -356,6 +362,11 @@ class EMC():
             self.comm.Reduce(MPI.IN_PLACE, [self.model, MPI.DOUBLE], root=0, op=MPI.SUM)
             self.comm.Reduce(MPI.IN_PLACE, [self.mweights, MPI.DOUBLE], root=0, op=MPI.SUM)
             self.model[self.mweights > 0] /= self.mweights[self.mweights > 0]
+
+            if self.need_scaling and self.model.ndim == 4:
+                mscale = float(self.scales.sum()) / (self.dset.num_data - self.num_blacklist)
+                self.scales /= mscale
+                self.model *= mscale
 
             self._save_output(iternum)
             diff = np.linalg.norm((self.model - old_model).ravel()) / self.model.size**0.5
