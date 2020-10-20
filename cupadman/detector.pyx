@@ -105,7 +105,9 @@ cdef class CDetector:
             raise ValueError('Need 3 values on header line: num_pix, detd_pix, ewald_rad_vox')
 
     def _parse_asciidet(self, norm=True, twodim=False):
-        print('Parsing ASCII detector file')
+        sys.stderr.write('Parsing ASCII detector file\n')
+        sys.stderr.flush()
+
         self._check_header()
         dframe = pandas.read_csv(
             self.fname,
@@ -137,7 +139,8 @@ cdef class CDetector:
                 self.det.qvals[t*3 + d] = qvals[t, d]
 
     def _parse_h5det(self, norm=True, twodim=False):
-        print('Parsing HDF5 detector file')
+        sys.stderr.write('Parsing HDF5 detector file\n')
+        sys.stderr.flush()
 
         fptr = h5py.File(self.fname, 'r')
         self.det.detd = fptr['detd'][()]

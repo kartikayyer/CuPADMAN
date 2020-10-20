@@ -71,7 +71,8 @@ cdef class Quaternion:
         if rank < (tot_num_rot % num_proc):
             self.quat.num_rot_p += 1
         if num_proc > 1:
-            print("%d: %s: num_rot_p = %d/%d" % (rank, gethostname(), self.num_rot_p, tot_num_rot))
+            sys.stderr.write("%d: %s: num_rot_p = %d/%d\n" % (rank, gethostname(), self.num_rot_p, tot_num_rot))
+            sys.stderr.flush()
         return self.quat.num_rot_p
 
     def reduce_icosahedral(self):
