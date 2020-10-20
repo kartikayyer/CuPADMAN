@@ -391,6 +391,7 @@ class EMC():
             self.comm.Reduce(MPI.IN_PLACE, [self.model, MPI.DOUBLE], root=0, op=MPI.SUM)
             self.comm.Reduce(MPI.IN_PLACE, [self.mweights, MPI.DOUBLE], root=0, op=MPI.SUM)
             self.model[self.mweights > 0] /= self.mweights[self.mweights > 0]
+            self._sym_friedel()
 
             if self.need_scaling and self.model.ndim == 4:
                 mscale = float(self.scales.sum()) / (self.dset.num_data - self.num_blacklist)
@@ -480,6 +481,16 @@ class EMC():
         if all_ranks or self.rank == 0:
             sys.stderr.write(string+'\n')
             sys.stderr.flush()
+
+    def _sym_friedel(self):
+        if self.model.ndim == 3: # 2D model
+            self.model = 0.5 * (self.model*self.mweights + self.model[:,::-1,::-1]*self.mweights[:,::-1,::-1])
+            self.mweights = 0.5 * (self.mweights + self.mweights[:,::-1,::-1])
+            self.model[self.mweights > 0] /= self.mweights[self.mweights > 0]
+        elif self.model.ndim == 4: # 3D model
+            self.model = 0.5 * (self.model*self.mweights + self.model[:,::-1,::-1,::-1]*self.mweights[:,::-1,::-1,::-1])
+            self.mweights = 0.5 * (self.mweights + self.mweights[:,::-1,::-1,::-1])
+            self.model[self.mweights > 0] /= self.mweights[self.mweights > 0]
 
 def main():
     '''Parses command line arguments and launches EMC reconstruction'''
