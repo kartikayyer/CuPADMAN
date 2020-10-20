@@ -113,6 +113,9 @@ class EMC():
         self.k_slice_merge = kernels.get_function('slice_merge'+rtype)
         self.k_calc_prob_all = kernels.get_function('calc_prob_all')
         self.k_merge_all = kernels.get_function('merge_all')
+        self.k_norm_prob = kernels.get_function('norm_prob')
+        self.k_calc_psum = cp.ReductionKernel('T prob, T beta, T max_exp', 'T psum', 'exp(beta * (prob - max_exp))', 'a + b', 'psum = a', '0', 'calc_psum2')
+        self.k_calc_pnorm = cp.ReductionKernel('T prob, T scale', 'T pnorm', 'prob*scale', 'a + b', 'pnorm = a', '0', 'calc_pnorm')
 
         # -- Generate iterate
         # ---- Model
@@ -139,7 +142,7 @@ class EMC():
                 self.scales = cp.ones(self.dset.num_data)
             else:
                 with h5py.File(scale_fname) as fptr:
-                    self.scales = f['scale'][:]
+                    self.scales = cp.array(fptr['scale'][:])
                 assert self.scales.shape[0] == self.dset.num_data
                 self.known_scale = True
 
@@ -180,7 +183,10 @@ class EMC():
         self.bsize_pixel = int(np.ceil(self.det.num_pix/32.))
         self.bsize_data = int(np.ceil(self.dset.num_data/32.))
         self.stream_list = [cp.cuda.Stream() for _ in range(self.num_streams)]
+        self.likelihood = np.zeros(self.dset.num_data)
         self.mutual_info = np.zeros(self.dset.num_data)
+        rotindarr = cp.arange(self.rank, self.quat.num_rot*self.num_modes, self.num_proc) // self.num_modes
+        self.qweight = self.quats[rotindarr, 4] / self.num_modes
 
         self._log_print('Completed setup: %f s' % (time.time() - stime), all_ranks=True)
 
@@ -293,6 +299,7 @@ class EMC():
         stime = time.time()
         s = drange[0]
         e = drange[1]
+        num_data_b = int(e - s)
 
         # Calculate max_exp
         max_exp_p = self.prob.max(0).get()
@@ -306,23 +313,28 @@ class EMC():
         self.comm.Allreduce([rmax_p, MPI.INT], [self.rmax, MPI.INT], op=MPI.MAX)
         max_exp = cp.array(max_exp)
 
-        # Exponentiate prob
-        cp.subtract(self.prob, max_exp, self.prob)
-        cp.multiply(self.prob, self.beta[s:e], self.prob)
-        self.prob = cp.exp(self.prob, self.prob)
+        # Calculate normalization factor over r
+        psum_p = self.k_calc_psum(self.prob, self.beta[s:e], max_exp, axis=0)
+        psum = np.empty(psum_p.shape)
+        self.comm.Allreduce([psum_p.get(), MPI.DOUBLE], [psum, MPI.DOUBLE], op=MPI.SUM)
+        psum = cp.array(psum)
 
-        # Normalize prob
-        psum_p = self.prob.sum(0).get()
-        psum = np.empty_like(psum_p)
-        self.comm.Allreduce([psum_p, MPI.DOUBLE], [psum, MPI.DOUBLE], op=MPI.SUM)
-        self.prob = cp.divide(self.prob, cp.array(psum), self.prob)
+        # Get normalized prob and other metrics
+        s_norm_p = cp.empty(num_data_b)
+        like_p = cp.empty(num_data_b)
+        info_p = cp.empty(num_data_b)
 
-        if self.rank == 0:
-           self.mutual_info[s:e] = 0.
-        rotindarr = cp.arange(self.rank, self.quat.num_rot*self.num_modes, self.num_proc) // self.num_modes
-        #priv->likelihood[d] += prob[d][ind] * (temp - frames->sum_fact[d]) ;
-        info_p = (self.prob * cp.log(self.prob * self.num_modes / self.quats[rotindarr, 4][:,cp.newaxis])).sum(0).get()
-        self.comm.Allreduce([info_p, MPI.DOUBLE], [self.mutual_info[s:e], MPI.DOUBLE], op=MPI.SUM)
+        self.k_norm_prob((self.bsize_data,), (32,),
+                (self.beta[s:e], max_exp, psum, self.qweight, self.vsum,
+                 self.blacklist[s:e], self.quat.num_rot_p, num_data_b,
+                 self.prob, s_norm_p, like_p, info_p))
+
+        self.likelihood[s:e] = 0.
+        self.mutual_info[s:e] = 0.
+        self.s_norm = np.zeros(s_norm_p.shape)
+        self.comm.Allreduce([s_norm_p.get(), MPI.DOUBLE], [self.s_norm, MPI.DOUBLE], op=MPI.SUM)
+        self.comm.Allreduce([info_p.get(), MPI.DOUBLE], [self.mutual_info[s:e], MPI.DOUBLE], op=MPI.SUM)
+        self.comm.Allreduce([like_p.get(), MPI.DOUBLE], [self.likelihood[s:e], MPI.DOUBLE], op=MPI.SUM)
 
         self._log_print('\tnorm\t%f'%(time.time() - stime))
 
@@ -333,13 +345,9 @@ class EMC():
         num_data_b = e - s
 
         if self.need_scaling:
-            p_norm = (self.prob * self.scales[s:e]).sum(1)
+            p_norm = self.k_calc_pnorm(self.prob, self.scales[s:e], axis=1)
             if self.update_scale:
-                s_norm_p = ((self.prob * self.vsum[:, cp.newaxis]).sum(0) * self.rescale).get()
-                s_norm = np.zeros_like(s_norm_p)
-                self.comm.Allreduce([s_norm_p, MPI.DOUBLE], [s_norm, MPI.DOUBLE], op=MPI.SUM)
-
-                self.scales[s:e] = cp.array(self.dset.fcounts[s:e] / s_norm)
+                self.scales[s:e] = cp.array(self.dset.fcounts[s:e] / self.s_norm) / self.rescale
         else:
             p_norm = self.prob.sum(1)
 
@@ -446,8 +454,9 @@ class EMC():
         else:
             fptr = open(self.log_file, 'a')
 
+        mean_like = self.likelihood[self.blacklist.get()==0].mean()
         mean_info = self.mutual_info[self.blacklist.get()==0].mean()
-        fptr.write('%-6d%-.2f   %.4e   %f   %e    %-8d %f\n' % (iternum, itertime, norm, mean_info, 0, self.quat.num_rot, self.beta.mean()))
+        fptr.write('%-6d%-.2f   %.4e   %f   %e    %-8d %f\n' % (iternum, itertime, norm, mean_info, mean_like, self.quat.num_rot, self.beta.mean()))
         fptr.close()
 
     def _move_to_gpu(self):
