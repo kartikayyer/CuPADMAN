@@ -1,5 +1,6 @@
 extern "C" {
 
+#define PROB_MIN 1.e-6
 typedef unsigned char uint8_t ;
 
 __device__
@@ -285,6 +286,45 @@ void merge_all(const double *prob_r, const long long ndata, const uint8_t *black
 		if (mask[pixel] < 2)
 			atomicAdd(&view[pixel], prob_r[d] * c_m[t]) ;
 	}
+}
+
+__global__
+void norm_prob(const double *beta, const double *max_exp, const double *psum, const double *qweight,
+               const double *vsum, const uint8_t *blacklist, const long long nrot, const long long ndata, 
+               double* __restrict__ prob, double *s_norm, double *likelihood, double *info) {
+	long long d = blockDim.x * blockIdx.x + threadIdx.x ;
+    if (d >= ndata)
+        return ;
+	if (blacklist[d] == 1)
+		return ;
+    long long r ;
+    double temp, pval ;
+
+    s_norm[d] = 0. ;
+    likelihood[d] = 0. ;
+    info[d] = 0. ;
+    for (r = 0 ; r < nrot ; ++r) {
+        // Uncorrected log-probability
+        temp = prob[r*ndata + d] ;
+
+        // Normalized probability after exponentiation
+        pval = exp(beta[d] * (temp - max_exp[d])) / psum[d] ;
+        prob[r*ndata + d] = pval ;
+
+        // Calculate likelihood
+        //likelihood[d] += pval * (temp - sum_fact[d]) ;
+        likelihood[d] += pval * temp ;
+
+        // Calculate s_norm (denominator for scale factor update) [without rescale]
+        s_norm[d] += pval * vsum[r] ;
+
+        // Skip if probability is very low (saves time)
+        if (pval < PROB_MIN)
+            continue ;
+
+        // Calculate mutual info
+        info[d] += pval * log(pval / qweight[r]) ;
+    }
 }
 
 } // extern C
