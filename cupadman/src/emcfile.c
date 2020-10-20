@@ -208,27 +208,19 @@ void calc_frame_counts(struct detector *det, struct dataset *self) {
 			for (t = 0 ; t < self->multi[d] ; ++t)
 			if (det->raw_mask[self->place_multi[self->multi_accum[d] + t]] < 1)
 				self->fcounts[d] += self->count_multi[self->multi_accum[d] + t] ;
-			
-			self->mean_count += self->fcounts[d] ;
 		}
 	}
 	else if (self->ftype == DENSE_INT) {
 		for (d = 0 ; d < self->num_data ; ++d) {
 			for (t = 0 ; t < self->num_pix ; ++t)
 				self->fcounts[d] += self->int_frames[d*self->num_pix + t] ;
-			
-			self->mean_count += self->fcounts[d] ;
 		}
 	}
 	else if (self->ftype == DENSE_DOUBLE) {
 		for (d = 0 ; d < self->num_data ; ++d) {
 			for (t = 0 ; t < self->num_pix ; ++t)
 				self->fcounts[d] += self->frames[d*self->num_pix + t] ;
-			
-			self->mean_count += self->fcounts[d] ;
 		}
 	}
-	
-	self->mean_count /= self->num_data ;
 }
 
