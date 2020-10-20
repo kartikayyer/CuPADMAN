@@ -15,7 +15,7 @@ import cupy as cp
 
 from cupadman import CDetector, CDataset, Quaternion
 P_MIN = 1.e-6
-MEM_THRESH = 0.01
+MEM_THRESH = 0.4
 
 class EMC():
     '''Reconstructor object using parameters from config file
@@ -199,7 +199,7 @@ class EMC():
         block_sizes = np.array([self.dset.num_data // num_blocks] * num_blocks)
         block_sizes[0:self.dset.num_data % num_blocks] += 1
         if len(block_sizes) > 1:
-            self._log_print('\t%d blocks with %s frames in each block' % (len(block_sizes), block_sizes))
+            self._log_print('\t%d blocks with %d-%d frames in each block' % (len(block_sizes), block_sizes.min(), block_sizes.max()))
 
         if self.prob.shape != (self.quat.num_rot_p, block_sizes.max()):
             self.prob = cp.empty((self.quat.num_rot_p, block_sizes.max()), dtype='f8')
@@ -218,6 +218,8 @@ class EMC():
         b_start = 0
         for i, b in enumerate(block_sizes):
             drange = (b_start, b_start + b)
+            if b < block_sizes.max():
+                self.prob = cp.resize(self.prob, (self.quat.num_rot_p, b))
             self._calculate_prob(dmodel, views, drange)
             self._normalize_prob(drange)
             self._update_model(views, dmodel, dmweights, drange)
@@ -232,7 +234,7 @@ class EMC():
 
     def _calculate_rescale(self, dmodel, views):
         stime = time.time()
-        self.vsum = cp.zeros(self.quat.num_rot*self.num_modes, dtype='f8')
+        self.vsum = cp.zeros(self.quat.num_rot_p, dtype='f8')
         total = 0.
 
         for i, r in enumerate(range(self.rank, self.quat.num_rot*self.num_modes, self.num_proc)):
@@ -245,11 +247,12 @@ class EMC():
                     (dmodel[modenum], self.quats[rotind], self.pixvals,
                      self.dmask, 0., self.det.num_pix,
                      self.size, views[snum]))
-            self.vsum[r] = views[snum][self.det.raw_mask==0].sum()
-            total += self.vsum[r] * self.quat.quats[rotind,4]
+            self.vsum[i] = views[snum][self.det.raw_mask==0].sum()
+            total += self.vsum[i] * self.quat.quats[rotind,4]
         [s.synchronize() for s in self.stream_list]
         cp.cuda.Stream().null.use()
 
+        total = self.comm.allreduce(float(total), op=MPI.SUM)
         self.rescale = self.dset.mean_count / total * self.num_modes
         self._log_print('\trescale\t%f (= %e)'%(time.time() - stime, self.rescale))
 
@@ -271,9 +274,9 @@ class EMC():
                      self.dmask, 1., self.det.num_pix,
                      self.size, views[snum]))
             if self.need_scaling and self.known_scale:
-                initvals = cp.log(self.quats[rotind,4]) - self.vsum[r] * self.scales[s:e]
+                initvals = cp.log(self.quats[rotind,4]) - self.vsum[i] * self.scales[s:e]
             else:
-                initvals = cp.log(self.quats[rotind,4]) - self.vsum[r] * cp.full((e-s,), self.rescale)
+                initvals = cp.log(self.quats[rotind,4]) - self.vsum[i] * cp.full((e-s,), self.rescale)
             self.k_calc_prob_all((self.bsize_data,), (32,),
                     (views[snum], num_data_b, self.blacklist[s:e],
                      self.ones[s:e], self.multi[s:e],
@@ -287,26 +290,36 @@ class EMC():
         self._log_print('\tprob\t%f'%(time.time() - stime))
 
     def _normalize_prob(self, drange):
+        stime = time.time()
         s = drange[0]
         e = drange[1]
-        stime = time.time()
+
+        # Calculate max_exp
         max_exp_p = self.prob.max(0).get()
         rmax_p = (self.prob.argmax(axis=0) * self.num_proc + self.rank).astype('i4').get()
         max_exp = np.empty_like(max_exp_p)
         self.rmax = np.empty_like(rmax_p)
 
+        # Reduce max_exp across ranks
         self.comm.Allreduce([max_exp_p, MPI.DOUBLE], [max_exp, MPI.DOUBLE], op=MPI.MAX)
         rmax_p[max_exp_p != max_exp] = -1
         self.comm.Allreduce([rmax_p, MPI.INT], [self.rmax, MPI.INT], op=MPI.MAX)
         max_exp = cp.array(max_exp)
 
-        self.prob = cp.exp(self.beta[s:e]*cp.subtract(self.prob, max_exp, self.prob), self.prob)
+        # Exponentiate prob
+        cp.subtract(self.prob, max_exp, self.prob)
+        cp.multiply(self.prob, self.beta[s:e], self.prob)
+        self.prob = cp.exp(self.prob, self.prob)
+
+        # Normalize prob
         psum_p = self.prob.sum(0).get()
         psum = np.empty_like(psum_p)
         self.comm.Allreduce([psum_p, MPI.DOUBLE], [psum, MPI.DOUBLE], op=MPI.SUM)
         self.prob = cp.divide(self.prob, cp.array(psum), self.prob)
 
-        rotindarr = cp.arange(self.rank, self.quat.num_rot*self.num_modes, self.num_proc) % self.quat.num_rot
+        if self.rank == 0:
+           self.mutual_info[s:e] = 0.
+        rotindarr = cp.arange(self.rank, self.quat.num_rot*self.num_modes, self.num_proc) // self.num_modes
         #priv->likelihood[d] += prob[d][ind] * (temp - frames->sum_fact[d]) ;
         info_p = (self.prob * cp.log(self.prob * self.num_modes / self.quats[rotindarr, 4][:,cp.newaxis])).sum(0).get()
         self.comm.Allreduce([info_p, MPI.DOUBLE], [self.mutual_info[s:e], MPI.DOUBLE], op=MPI.SUM)
@@ -322,7 +335,11 @@ class EMC():
         if self.need_scaling:
             p_norm = (self.prob * self.scales[s:e]).sum(1)
             if self.update_scale:
-                self.scales[s:e] = cp.array(self.dset.fcounts[s:e]) / (self.prob * self.vsum[:, cp.newaxis]).sum(0) / self.rescale
+                s_norm_p = ((self.prob * self.vsum[:, cp.newaxis]).sum(0) * self.rescale).get()
+                s_norm = np.zeros_like(s_norm_p)
+                self.comm.Allreduce([s_norm_p, MPI.DOUBLE], [s_norm, MPI.DOUBLE], op=MPI.SUM)
+
+                self.scales[s:e] = cp.array(self.dset.fcounts[s:e] / s_norm)
         else:
             p_norm = self.prob.sum(1)
 
